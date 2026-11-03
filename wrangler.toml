@@ -1,0 +1,3 @@
+name = "isaiahai-private-gateway"
+main = "src/index.js"
+compatibility_date = "2026-11-03"
