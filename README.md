@@ -1,22 +1,46 @@
-# IsaiahAI Private Model Gateway
+# IsaiahAI CodePro Gateway
 
-This repository contains server code only. Never commit API keys, .env files, tokens, or credentials here.
+A Node.js HTTP service for the IsaiahAI CodePro Windows client. It uses Groq's `openai/gpt-oss-120b` model with Groq-hosted browser search and sandboxed code execution.
 
-## Runtime secret
+## Hosting
 
-Deploy this Worker to Cloudflare Workers, then add a secret named GROQ_API_KEY in Worker settings (or with wrangler secret put GROQ_API_KEY). Use the newly rotated Groq key. Never place it in GitHub source, the mobile site, or the Windows executable.
+This repository is prepared for Railway. It is **not** a GitHub Pages server and does not use Cloudflare.
 
-## Deploy
+1. Connect this repository to a Railway project.
+2. Add the following Railway service variables:
+   - `GROQ_API_KEY`: a newly rotated Groq API key (stored in Railway's private variables, never in Git).
+   - `CODEPRO_CLIENT_TOKEN`: a long random client token. The Windows client sends it as a Bearer token.
+3. Deploy. Railway detects the Node app and runs `npm start`.
+4. Verify `https://YOUR-SERVICE.up.railway.app/health`; it should report the model and both configuration flags as true.
 
-1. Install Wrangler and authenticate with your Cloudflare account.
-2. Run npm install.
-3. Run npx wrangler secret put GROQ_API_KEY and paste the rotated key into the terminal prompt.
-4. Run npm run deploy.
-5. Configure the resulting Worker URL in the Windows CodePro app. Keep mobile on its current Netlify endpoint until the gateway is deployed and tested.
+## API
 
-## Endpoints
+- `GET /health` — health/configuration status; never returns secrets.
+- `POST /api/agent` — Server-Sent Events progress and text stream.
+- `POST /api/chat` — JSON response, or SSE when the request body contains `"stream": true`.
 
-- GET /health reports service status and whether the secret is configured.
-- POST /api/chat forwards chat requests to Groq using the server-side secret.
+Both POST endpoints require `Authorization: Bearer YOUR_CODEPRO_CLIENT_TOKEN`.
 
-This is a deployment scaffold, not a deployed service. Add production authentication and rate limiting before exposing it broadly.
+Example body:
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "Research the latest Node.js LTS release and write a short summary." }
+  ]
+}
+```
+
+The model can autonomously use Groq's built-in `browser_search` and `code_interpreter` tools. Code execution happens in Groq's remote Python sandbox; it does not execute arbitrary commands on the user's Windows computer. Local Windows actions need a separate desktop-side permissioned tool bridge.
+
+## Local development
+
+Use Node.js 20 or later:
+
+```powershell
+$env:GROQ_API_KEY="your-new-groq-key"
+$env:CODEPRO_CLIENT_TOKEN="a-long-random-client-token"
+npm start
+```
+
+Never commit `.env` files, API credentials, or client tokens. The previous Cloudflare Worker scaffold has been removed.
