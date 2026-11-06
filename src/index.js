@@ -12,7 +12,6 @@ const MAX_OUTPUT_TOKENS = 6000;
 const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 20;
 const requestsByIp = new Map();
-let providerProbeUsed = false;
 
 const SYSTEM_PROMPT = `You are IsaiahAI CodePro, a capable, careful AI agent powered by GPT-OSS-120B.
 Act like an agent: understand the goal, plan briefly, use available browser-search and code-interpreter tools when they materially help, inspect tool outputs, and only then provide the final answer.
@@ -260,53 +259,6 @@ const server = http.createServer(async (req, res) => {
       groqConfigured: Boolean(process.env.GROQ_API_KEY),
       accessConfigured: Boolean(process.env.CODEPRO_CLIENT_TOKEN)
     });
-  }
-
-  if (req.method === "POST" && process.env.CODEPRO_TOKEN_PROBE &&
-      safeEqual(url.pathname, `/__verify/${process.env.CODEPRO_TOKEN_PROBE}`)) {
-    if (providerProbeUsed) return sendJson(res, 410, { error: "Verification probe already used." });
-    providerProbeUsed = true;
-    try {
-      const upstream = await fetch(GROQ_URL, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [{ role: "user", content: "Use the code interpreter to calculate 132 multiplied by 47. Reply with only the integer result." }],
-          tools: [{ type: "code_interpreter" }],
-          tool_choice: "required",
-          reasoning_effort: "medium",
-          max_completion_tokens: 1200
-        })
-      });
-      const payload = await upstream.json().catch(() => ({}));
-      if (!upstream.ok) {
-        const message = payload.error?.message || `Groq request failed (${upstream.status}).`;
-        console.error("[CODEPRO_PROVIDER_PROBE]", JSON.stringify({ ok: false, status: upstream.status, error: message }));
-        return sendJson(res, 502, { ok: false, error: message });
-      }
-      const answer = payload.choices?.[0]?.message || {};
-      const executedTools = Array.isArray(answer.executed_tools) ? answer.executed_tools.map(toolName) : [];
-      const content = typeof answer.content === "string" ? answer.content : "";
-      console.log("[CODEPRO_PROVIDER_PROBE]", JSON.stringify({
-        ok: true,
-        model: payload.model || MODEL,
-        tools: executedTools,
-        content
-      }));
-      return sendJson(res, 200, {
-        ok: true,
-        model: payload.model || MODEL,
-        tools: executedTools,
-        content
-      });
-    } catch (error) {
-      console.error("[CODEPRO_PROVIDER_PROBE]", JSON.stringify({ ok: false, error: error.message }));
-      return sendJson(res, 502, { ok: false, error: "Provider probe could not complete." });
-    }
   }
 
   if (req.method !== "POST" || !["/api/chat", "/api/agent"].includes(url.pathname)) {
