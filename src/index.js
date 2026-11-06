@@ -321,8 +321,8 @@ const server = http.createServer(async (req, res) => {
       cloudflareConfigured: Boolean(process.env.CLOUDFLARE_API_TOKEN && /^[a-f0-9]{32}$/i.test(String(process.env.CLOUDFLARE_ACCOUNT_ID || DEFAULT_CLOUDFLARE_ACCOUNT_ID))),
       accessConfigured: Boolean(process.env.CODEPRO_CLIENT_TOKEN),
       capabilities: {
-        browserSearch: true,
-        codeInterpreter: true,
+        browserNavigation: "IsaiahSearch desktop client",
+        browserPageInspection: "IsaiahSearch desktop client",
         windowsShellBridge: "IsaiahSearch desktop client"
       }
     });
