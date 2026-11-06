@@ -26,7 +26,8 @@ function sendJson(res, status, body) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff"
+    "X-Content-Type-Options": "nosniff",
+    "Access-Control-Allow-Origin": "*"
   });
   res.end(data);
 }
@@ -116,7 +117,7 @@ async function handleAgent(req, res, body) {
   }
 
   const controller = new AbortController();
-  req.on("close", () => {
+  res.on("close", () => {
     if (!res.writableEnded) controller.abort();
   });
 
