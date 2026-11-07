@@ -82,11 +82,16 @@ function safeEqual(a, b) {
 }
 
 function authorized(req) {
-  const expected = process.env.CODEPRO_CLIENT_TOKEN;
-  // Public desktop clients cannot keep a shared bearer token secret inside an installer.
-  // When no token is configured, allow the public client and enforce per-IP rate limiting.
-  if (!expected) return true;
-  const supplied = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const expected = String(process.env.CODEPRO_CLIENT_TOKEN || "").trim();
+  const authorization = String(req.headers.authorization || "").trim();
+
+  // A public Windows installer cannot safely contain a shared bearer secret.
+  // Desktop clients therefore use the public, IP-rate-limited path when they
+  // omit Authorization. If an integration does send a bearer token, validate it.
+  if (!authorization) return true;
+  if (!expected) return false;
+
+  const supplied = authorization.replace(/^Bearer\s+/i, "");
   return safeEqual(supplied, expected);
 }
 
@@ -475,6 +480,8 @@ const server = http.createServer(async (req, res) => {
       // reports whether an actual Cloudflare API token is configured.
       cloudflareConfigured: providerReady,
       accessConfigured: Boolean(process.env.CODEPRO_CLIENT_TOKEN),
+      publicDesktopAccess: true,
+      rateLimitPerIpPerMinute: RATE_LIMIT,
       capabilities: {
         browserNavigation: "IsaiahSearch desktop client",
         browserPageInspection: "IsaiahSearch desktop client",
