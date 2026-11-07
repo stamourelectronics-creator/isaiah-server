@@ -3,7 +3,9 @@ import { timingSafeEqual } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = "0.0.0.0";
-const MODEL = process.env.CLOUDFLARE_MODEL || "@cf/zai-org/glm-4.7-flash";
+const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_MODEL || "@cf/zai-org/glm-4.7-flash";
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_CLOUDFLARE_ACCOUNT_ID = "01fd8f1d70219de577b4d40e01be7b6a";
 const MAX_BODY_BYTES = 160_000;
 const MAX_MESSAGES = 30;
@@ -157,15 +159,61 @@ function cloudflareErrorMessage(payload, status) {
   return message || ("Cloudflare Workers AI request failed (" + status + ").");
 }
 
+function providerErrorMessage(provider, payload, status) {
+  if (provider === "Cloudflare Workers AI") return cloudflareErrorMessage(payload, status);
+  return payload?.error?.message || payload?.message || ("Groq request failed (" + status + ").");
+}
+
 async function handleAgent(req, res, body) {
   const token = String(process.env.CLOUDFLARE_API_TOKEN || "").trim();
   const accountId = String(process.env.CLOUDFLARE_ACCOUNT_ID || DEFAULT_CLOUDFLARE_ACCOUNT_ID).trim();
-  if (!token) return sendJson(res, 503, { error: "Cloudflare Workers AI is not configured yet. Add CLOUDFLARE_API_TOKEN as a private Railway variable." });
-  if (!/^[a-f0-9]{32}$/i.test(accountId)) return sendJson(res, 503, { error: "The Cloudflare account ID is missing or invalid on the server." });
+  const groqKey = String(process.env.GROQ_API_KEY || "").trim();
+  const cloudflareConfigured = Boolean(token && /^[a-f0-9]{32}$/i.test(accountId));
+  const providers = [];
+
+  if (cloudflareConfigured) {
+    providers.push({
+      name: "Cloudflare Workers AI",
+      model: CLOUDFLARE_MODEL,
+      endpoint: "https://api.cloudflare.com/client/v4/accounts/" + accountId + "/ai/run/" + CLOUDFLARE_MODEL,
+      headers: { "Authorization": "Bearer " + token },
+      makeBody: (messages, stream) => ({
+        messages,
+        max_completion_tokens: MAX_OUTPUT_TOKENS,
+        reasoning_effort: "high",
+        temperature: 0.6,
+        stream
+      })
+    });
+  }
+
+  // Keep CodePro available when Cloudflare is not configured or its model is unavailable.
+  if (groqKey) {
+    providers.push({
+      name: "Groq",
+      model: GROQ_MODEL,
+      endpoint: GROQ_URL,
+      headers: { "Authorization": "Bearer " + groqKey },
+      makeBody: (messages, stream) => ({
+        model: GROQ_MODEL,
+        messages,
+        reasoning_effort: "high",
+        max_completion_tokens: MAX_OUTPUT_TOKENS,
+        temperature: 0.6,
+        stream
+      })
+    });
+  }
 
   const messages = cleanMessages(body);
   const wantsStream = req.url.startsWith("/api/agent") || body.stream === true;
-  const endpoint = "https://api.cloudflare.com/client/v4/accounts/" + accountId + "/ai/run/" + MODEL;
+
+  if (!providers.length) {
+    return sendJson(res, 503, {
+      error: "No CodePro model provider is configured. Add CLOUDFLARE_API_TOKEN or GROQ_API_KEY as a private Railway variable.",
+      providerReady: false
+    });
+  }
 
   if (wantsStream) {
     res.writeHead(200, {
@@ -177,7 +225,7 @@ async function handleAgent(req, res, body) {
     });
     res.flushHeaders?.();
     sendEvent(res, "status", { status: "thinking", message: "IsaiahAI CodePro is thinking…" });
-    sendEvent(res, "status", { status: "planning", message: "Reviewing your request and choosing the next action…" });
+    sendEvent(res, "status", { status: "planning", message: "Checking the available AI gateway and preparing the next action…" });
   }
 
   const controller = new AbortController();
@@ -186,31 +234,50 @@ async function handleAgent(req, res, body) {
   });
 
   try {
-    const upstream = await fetch(endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Authorization": "Bearer " + token,
-        "Content-Type": "application/json",
-        "Accept": wantsStream ? "text/event-stream" : "application/json"
-      },
-      body: JSON.stringify({
-        messages,
-        max_completion_tokens: MAX_OUTPUT_TOKENS,
-        reasoning_effort: "high",
-        temperature: 0.6,
-        stream: wantsStream
-      })
-    });
+    let upstream = null;
+    let activeProvider = null;
+    let lastProviderError = "";
 
-    if (!upstream.ok) {
-      const payload = await upstream.json().catch(() => ({}));
-      const message = cloudflareErrorMessage(payload, upstream.status);
+    for (const provider of providers) {
+      try {
+        const response = await fetch(provider.endpoint, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            ...provider.headers,
+            "Content-Type": "application/json",
+            "Accept": wantsStream ? "text/event-stream" : "application/json"
+          },
+          body: JSON.stringify(provider.makeBody(messages, wantsStream))
+        });
+
+        if (response.ok) {
+          upstream = response;
+          activeProvider = provider;
+          break;
+        }
+
+        const payload = await response.json().catch(() => ({}));
+        lastProviderError = providerErrorMessage(provider.name, payload, response.status);
+        console.warn("[CODEPRO_PROVIDER]", JSON.stringify({
+          provider: provider.name,
+          status: response.status,
+          fallbackAvailable: providers.indexOf(provider) < providers.length - 1
+        }));
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        lastProviderError = provider.name + " connection failed: " + String(error?.message || error).slice(0, 180);
+        console.warn("[CODEPRO_PROVIDER]", JSON.stringify({ provider: provider.name, connectionFailed: true }));
+      }
+    }
+
+    if (!upstream || !activeProvider) {
+      const message = lastProviderError || "No configured CodePro provider returned a response.";
       if (wantsStream) {
         sendEvent(res, "error", { message });
         res.end();
       } else {
-        sendJson(res, upstream.status >= 500 ? 502 : upstream.status, { error: message });
+        sendJson(res, 502, { error: message, providerReady: false });
       }
       return;
     }
@@ -219,13 +286,15 @@ async function handleAgent(req, res, body) {
       const payload = await upstream.json();
       const content = extractCloudflareContent(payload).trim();
       if (!content) {
-        const hint = payload?.success === false ? cloudflareErrorMessage(payload, 502) : "Cloudflare Workers AI returned an empty response.";
+        const hint = payload?.success === false
+          ? providerErrorMessage(activeProvider.name, payload, 502)
+          : activeProvider.name + " returned an empty response.";
         return sendJson(res, 502, { error: hint });
       }
       sendJson(res, 200, {
         brand: "IsaiahAI CodePro",
-        provider: "Cloudflare Workers AI",
-        model: MODEL,
+        provider: activeProvider.name,
+        model: activeProvider.model,
         content,
         tools: [],
         usage: payload?.result?.usage || payload?.usage || null
@@ -275,13 +344,13 @@ async function handleAgent(req, res, body) {
     }
 
     if (!fullText.trim()) {
-      sendEvent(res, "error", { message: "Cloudflare Workers AI finished without returning any text." });
+      sendEvent(res, "error", { message: activeProvider.name + " finished without returning any text." });
     } else {
       sendEvent(res, "status", { status: "checking", message: "Checking the completed work…" });
       sendEvent(res, "done", {
         brand: "IsaiahAI CodePro",
-        provider: "Cloudflare Workers AI",
-        model: MODEL,
+        provider: activeProvider.name,
+        model: activeProvider.model,
         content: fullText,
         tools: []
       });
@@ -290,11 +359,11 @@ async function handleAgent(req, res, body) {
   } catch (error) {
     if (wantsStream) {
       if (!res.writableEnded) {
-        sendEvent(res, "error", { message: error.name === "AbortError" ? "Request cancelled." : "The CodePro server could not complete the Cloudflare request." });
+        sendEvent(res, "error", { message: error.name === "AbortError" ? "Request cancelled." : "The CodePro server could not complete the AI request." });
         res.end();
       }
     } else {
-      sendJson(res, 502, { error: error.message || "The CodePro server could not complete the Cloudflare request." });
+      sendJson(res, 502, { error: error.message || "The CodePro server could not complete the AI request." });
     }
   }
 }
@@ -313,12 +382,29 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/health") {
+    const cloudflareTokenConfigured = Boolean(
+      String(process.env.CLOUDFLARE_API_TOKEN || "").trim() &&
+      /^[a-f0-9]{32}$/i.test(String(process.env.CLOUDFLARE_ACCOUNT_ID || DEFAULT_CLOUDFLARE_ACCOUNT_ID))
+    );
+    const groqFallbackConfigured = Boolean(String(process.env.GROQ_API_KEY || "").trim());
+    const providerReady = cloudflareTokenConfigured || groqFallbackConfigured;
+    const activeProvider = cloudflareTokenConfigured
+      ? { name: "Cloudflare Workers AI", model: CLOUDFLARE_MODEL }
+      : groqFallbackConfigured
+        ? { name: "Groq fallback", model: GROQ_MODEL }
+        : { name: "not configured", model: null };
+
     return sendJson(res, 200, {
       ok: true,
+      providerReady,
       service: "IsaiahAI CodePro Gateway",
-      model: MODEL,
-      provider: "Cloudflare Workers AI",
-      cloudflareConfigured: Boolean(process.env.CLOUDFLARE_API_TOKEN && /^[a-f0-9]{32}$/i.test(String(process.env.CLOUDFLARE_ACCOUNT_ID || DEFAULT_CLOUDFLARE_ACCOUNT_ID))),
+      provider: activeProvider.name,
+      model: activeProvider.model,
+      cloudflareTokenConfigured,
+      groqFallbackConfigured,
+      // Legacy clients use this as a gateway-ready flag; the explicit field above
+      // reports whether an actual Cloudflare API token is configured.
+      cloudflareConfigured: providerReady,
       accessConfigured: Boolean(process.env.CODEPRO_CLIENT_TOKEN),
       capabilities: {
         browserNavigation: "IsaiahSearch desktop client",
