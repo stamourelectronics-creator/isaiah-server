@@ -180,7 +180,6 @@ async function handleAgent(req, res, body) {
       makeBody: (messages, stream) => ({
         messages,
         max_completion_tokens: MAX_OUTPUT_TOKENS,
-        reasoning_effort: "high",
         temperature: 0.6,
         stream
       })
