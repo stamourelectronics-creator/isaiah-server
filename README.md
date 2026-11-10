@@ -22,6 +22,7 @@ Configure these private Railway variables:
 - `GEMINI_53_MODEL`, `GEMINI_60_70_MODEL`, `GEMINI_CODEPRO_MODEL`: optional model identifiers; defaults are listed above.
 - `GEMINI_FALLBACK_MODEL`: optional shared fallback model; defaults to `gemini-3.5-flash`.
 - `GEMINI_REQUEST_TIMEOUT_MS`: optional per-model attempt timeout in milliseconds; defaults to `20000` and is clamped between 10000 and 60000.
+- `GEMINI_SEARCH_GROUNDING_ENABLED`: defaults to `false` so chats work with standard free-tier keys. Set to `true` only when the Gemini account tier has Google Search grounding access. When disabled, the API returns a normal model answer with `searchUnavailable: true`; the website tells users the answer has no live web verification.
 - `OPEN_ISAIAH_KEYS_URL`: HTTPS endpoint returning a JSON array of API keys, or `{ "keys": [...] }`, for the Open-Isaiah pool.
 - `OPEN_ISAIAH_API_URL`: HTTPS OpenAI-compatible `/chat/completions`-style endpoint used with a key returned above.
 - `OPEN_ISAIAH_KEYS_TOKEN`: optional bearer token required to fetch the key pool.
