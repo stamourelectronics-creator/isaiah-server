@@ -9,6 +9,8 @@ const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GEMINI_CODEPRO_MODEL = process.env.GEMINI_CODEPRO_MODEL || "gemini-3.8-flash";
 const GEMINI_53_MODEL = process.env.GEMINI_53_MODEL || "gemini-3.5-flash-lite";
 const GEMINI_60_70_MODEL = process.env.GEMINI_60_70_MODEL || "gemini-3.8-flash";
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash";
+const GEMINI_REQUEST_TIMEOUT_MS = Math.max(10000, Math.min(60000, Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 35000)));
 const DEFAULT_CLOUDFLARE_ACCOUNT_ID = "01fd8f1d70219de577b4d40e01be7b6a";
 const MAX_BODY_BYTES = 160_000;
 const MAX_MESSAGES = 30;
@@ -227,7 +229,7 @@ function cloudflareErrorMessage(payload, status) {
 
 function providerErrorMessage(provider, payload, status) {
   if (provider === "Cloudflare Workers AI") return cloudflareErrorMessage(payload, status);
-  if (provider === "Gemini") {
+  if (provider === "Gemini" || String(provider).startsWith("Gemini")) {
     const detail = (Array.isArray(payload?.error?.details) ? payload.error.details : [])
       .map((item) => item?.message)
       .filter(Boolean)
@@ -385,36 +387,69 @@ async function callWebsiteGemini(body, model, systemPrompt) {
   if (body.searchWebEnabled !== false) {
     requestBody.tools = [{ google_search: {} }];
   }
-  const modelName = geminiModelForWebsite(model);
-  const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
-    method: "POST",
-    headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(90000)
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = providerErrorMessage("Gemini", payload, response.status);
-    throw Object.assign(new Error(message), { status: response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status });
+
+  const primaryModel = geminiModelForWebsite(model);
+  const fallbackModel = String(process.env.GEMINI_FALLBACK_MODEL || GEMINI_FALLBACK_MODEL).trim();
+  const modelsToTry = [primaryModel];
+  if (fallbackModel && fallbackModel !== primaryModel) modelsToTry.push(fallbackModel);
+
+  let lastError = null;
+  for (let attempt = 0; attempt < modelsToTry.length; attempt += 1) {
+    const modelName = modelsToTry[attempt];
+    try {
+      const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
+        method: "POST",
+        headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS)
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        lastError = Object.assign(new Error(providerErrorMessage("Gemini", payload, response.status)), {
+          status: response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
+        });
+        console.warn("[WEBSITE_GEMINI]", JSON.stringify({
+          selectedModel: model,
+          providerModel: modelName,
+          status: response.status,
+          fallbackAvailable: attempt < modelsToTry.length - 1
+        }));
+        continue;
+      }
+
+      const content = extractGeminiContent(payload).trim();
+      if (!content) {
+        lastError = Object.assign(new Error("Gemini returned an empty response for " + modelName + "."), { status: 502 });
+        continue;
+      }
+      const groundedChunks = payload?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+      const sources = groundedChunks
+        .map((chunk) => ({ title: chunk?.web?.title || "Web source", uri: chunk?.web?.uri || "" }))
+        .filter((item) => item.uri)
+        .slice(0, 12);
+      return {
+        brand: model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER",
+        provider: "Gemini API",
+        selectedProvider: "Gemini API",
+        selectedModel: model,
+        model: modelName,
+        fallbackUsed: attempt > 0,
+        content,
+        thinkingSummary: "",
+        sources,
+        usage: payload?.usageMetadata || null
+      };
+    } catch (error) {
+      lastError = Object.assign(new Error(String(error?.message || error).slice(0, 300)), { status: 502 });
+      console.warn("[WEBSITE_GEMINI]", JSON.stringify({
+        selectedModel: model,
+        providerModel: modelName,
+        timedOut: error?.name === "TimeoutError" || error?.name === "AbortError",
+        fallbackAvailable: attempt < modelsToTry.length - 1
+      }));
+    }
   }
-  const content = extractGeminiContent(payload).trim();
-  if (!content) throw Object.assign(new Error("Gemini returned an empty response for " + model + "."), { status: 502 });
-  const groundedChunks = payload?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-  const sources = groundedChunks
-    .map((chunk) => ({ title: chunk?.web?.title || "Web source", uri: chunk?.web?.uri || "" }))
-    .filter((item) => item.uri)
-    .slice(0, 12);
-  return {
-    brand: model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER",
-    provider: "Gemini API",
-    selectedProvider: "Gemini API",
-    selectedModel: model,
-    model: modelName,
-    content,
-    thinkingSummary: "",
-    sources,
-    usage: payload?.usageMetadata || null
-  };
+  throw lastError || Object.assign(new Error("Gemini did not return a response."), { status: 502 });
 }
 
 function extractOpenIsaiahKeys(payload) {
@@ -492,14 +527,18 @@ async function handleAgent(req, res, body) {
 
   const geminiCodeProKey = String(process.env.GEMINI_API_KEY_CODEPRO || "").trim();
   if (geminiCodeProKey) {
-    providers.push({
-      name: "Gemini",
-      model: GEMINI_CODEPRO_MODEL,
-      format: "gemini",
-      endpoint: (stream) => "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(GEMINI_CODEPRO_MODEL) + (stream ? ":streamGenerateContent?alt=sse" : ":generateContent"),
-      headers: { "x-goog-api-key": geminiCodeProKey },
-      makeBody: (messages) => makeGeminiAgentBody(messages, false, "high")
-    });
+    const geminiModels = [...new Set([GEMINI_CODEPRO_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean))];
+    for (const modelName of geminiModels) {
+      providers.push({
+        name: "Gemini",
+        model: modelName,
+        format: "gemini",
+        timeoutMs: GEMINI_REQUEST_TIMEOUT_MS,
+        endpoint: (stream) => "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + (stream ? ":streamGenerateContent?alt=sse" : ":generateContent"),
+        headers: { "x-goog-api-key": geminiCodeProKey },
+        makeBody: (messages) => makeGeminiAgentBody(messages, false, "high")
+      });
+    }
   }
 
   if (cloudflareConfigured) {
@@ -572,9 +611,11 @@ async function handleAgent(req, res, body) {
       try {
         const providerEndpoint = typeof provider.endpoint === "function" ? provider.endpoint(wantsStream) : provider.endpoint;
         const providerBody = provider.format === "gemini" ? makeGeminiAgentBody(messages, wantsStream, "high") : provider.makeBody(messages, wantsStream);
+        const timeoutSignal = AbortSignal.timeout(provider.timeoutMs || GEMINI_REQUEST_TIMEOUT_MS);
+        const providerSignal = AbortSignal.any([controller.signal, timeoutSignal]);
         const response = await fetch(providerEndpoint, {
           method: "POST",
-          signal: controller.signal,
+          signal: providerSignal,
           headers: {
             ...provider.headers,
             "Content-Type": "application/json",
@@ -597,7 +638,7 @@ async function handleAgent(req, res, body) {
           fallbackAvailable: providers.indexOf(provider) < providers.length - 1
         }));
       } catch (error) {
-        if (error?.name === "AbortError") throw error;
+        if (controller.signal.aborted) throw error;
         lastProviderError = provider.name + " connection failed: " + String(error?.message || error).slice(0, 180);
         console.warn("[CODEPRO_PROVIDER]", JSON.stringify({ provider: provider.name, connectionFailed: true }));
       }
