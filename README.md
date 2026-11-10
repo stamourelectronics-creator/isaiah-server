@@ -6,7 +6,7 @@ A Node.js HTTP gateway for IsaiahAI CodePro. It keeps provider credentials on th
 
 The desktop CodePro agent tries providers in this order: Gemini (when `GEMINI_API_KEY_CODEPRO` is configured), Cloudflare Workers AI, then Groq. The website model routes are also hosted here: IsaiahAI 5.3 Flash, Isaiah Max 6.0, IsaiahAI 7.0 SUPER, and CodePro use separate Gemini key slots. Open-Isaiah uses a configurable external key-pool service and an OpenAI-compatible chat endpoint.
 
-The default Gemini models are `gemini-3.5-flash-lite` for IsaiahAI 5.3 Flash and `gemini-3.8-flash` for Isaiah Max 6.0, 7.0 SUPER, and CodePro. Thinking mode supports low, medium, and high effort for supported Gemini 3 models. Automatic mode leaves the provider's dynamic thinking enabled.
+The default Gemini models are `gemini-3.5-flash-lite` for IsaiahAI 5.3 Flash and `gemini-3.8-flash` for Isaiah Max 6.0, 7.0 SUPER, and CodePro. If a primary model stalls or fails, the gateway retries with `gemini-3.5-flash` by default. Each provider attempt has a bounded timeout (`GEMINI_REQUEST_TIMEOUT_MS`, 20 seconds by default). Thinking mode supports low, medium, and high effort for supported Gemini 3 models. Automatic mode leaves the provider's dynamic thinking enabled.
 
 At least one provider key must be configured. For reliable service, configure both. All credentials belong in Railway's private Variables panel (or a local untracked `.env` file for development), never in Git, the desktop installer, or the renderer.
 
@@ -20,6 +20,8 @@ Configure these private Railway variables:
 - `GEMINI_API_KEY_70`: private Gemini key for IsaiahAI 7.0 SUPER.
 - `GEMINI_API_KEY_CODEPRO`: private Gemini key for the CodePro Windows agent.
 - `GEMINI_53_MODEL`, `GEMINI_60_70_MODEL`, `GEMINI_CODEPRO_MODEL`: optional model identifiers; defaults are listed above.
+- `GEMINI_FALLBACK_MODEL`: optional shared fallback model; defaults to `gemini-3.5-flash`.
+- `GEMINI_REQUEST_TIMEOUT_MS`: optional per-model attempt timeout in milliseconds; defaults to `20000` and is clamped between 10000 and 60000.
 - `OPEN_ISAIAH_KEYS_URL`: HTTPS endpoint returning a JSON array of API keys, or `{ "keys": [...] }`, for the Open-Isaiah pool.
 - `OPEN_ISAIAH_API_URL`: HTTPS OpenAI-compatible `/chat/completions`-style endpoint used with a key returned above.
 - `OPEN_ISAIAH_KEYS_TOKEN`: optional bearer token required to fetch the key pool.
