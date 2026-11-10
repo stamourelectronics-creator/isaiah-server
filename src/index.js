@@ -382,6 +382,9 @@ async function callWebsiteGemini(body, model, systemPrompt) {
   }
   const requestBody = websiteGeminiMessages(body, systemPrompt);
   requestBody.generationConfig = generationConfig;
+  if (body.searchWebEnabled !== false) {
+    requestBody.tools = [{ google_search: {} }];
+  }
   const modelName = geminiModelForWebsite(model);
   const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
     method: "POST",
@@ -396,15 +399,20 @@ async function callWebsiteGemini(body, model, systemPrompt) {
   }
   const content = extractGeminiContent(payload).trim();
   if (!content) throw Object.assign(new Error("Gemini returned an empty response for " + model + "."), { status: 502 });
+  const groundedChunks = payload?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+  const sources = groundedChunks
+    .map((chunk) => ({ title: chunk?.web?.title || "Web source", uri: chunk?.web?.uri || "" }))
+    .filter((item) => item.uri)
+    .slice(0, 12);
   return {
-    brand: model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "Isaiah AI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER",
+    brand: model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER",
     provider: "Gemini API",
     selectedProvider: "Gemini API",
     selectedModel: model,
     model: modelName,
     content,
     thinkingSummary: "",
-    sources: [],
+    sources,
     usage: payload?.usageMetadata || null
   };
 }
