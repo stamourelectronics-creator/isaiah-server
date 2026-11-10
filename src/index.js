@@ -11,6 +11,7 @@ const GEMINI_53_MODEL = process.env.GEMINI_53_MODEL || "gemini-3.5-flash-lite";
 const GEMINI_60_70_MODEL = process.env.GEMINI_60_70_MODEL || "gemini-3.8-flash";
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash";
 const GEMINI_REQUEST_TIMEOUT_MS = Math.max(10000, Math.min(60000, Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 20000)));
+const GEMINI_SEARCH_GROUNDING_ENABLED = process.env.GEMINI_SEARCH_GROUNDING_ENABLED === "true";
 const DEFAULT_CLOUDFLARE_ACCOUNT_ID = "01fd8f1d70219de577b4d40e01be7b6a";
 const MAX_BODY_BYTES = 160_000;
 const MAX_MESSAGES = 30;
@@ -374,6 +375,7 @@ async function callWebsiteGemini(body, model, systemPrompt) {
       : model === "isaiahai_7_super" ? "GEMINI_API_KEY_70" : "GEMINI_API_KEY_CODEPRO";
     throw Object.assign(new Error("The selected model is not configured. Add a fresh " + variable + " as a private Railway service variable."), { status: 503 });
   }
+
   const thinking = normalizeThinking(body);
   const generationConfig = {
     maxOutputTokens: model === "isaiah_5_3" ? 4096 : 8192,
@@ -382,22 +384,32 @@ async function callWebsiteGemini(body, model, systemPrompt) {
   if (thinking.mode === "thinking") {
     generationConfig.thinkingConfig = { thinkingLevel: thinking.effort.toUpperCase() };
   }
-  const requestBody = websiteGeminiMessages(body, systemPrompt);
-  requestBody.generationConfig = generationConfig;
-  if (body.searchWebEnabled !== false) {
-    requestBody.tools = [{ google_search: {} }];
-  }
 
+  const searchRequested = body.searchWebEnabled === true;
+  const groundingAllowed = searchRequested && GEMINI_SEARCH_GROUNDING_ENABLED;
   const primaryModel = geminiModelForWebsite(model);
   const fallbackModel = String(process.env.GEMINI_FALLBACK_MODEL || GEMINI_FALLBACK_MODEL).trim();
-  const modelsToTry = [primaryModel];
-  if (fallbackModel && fallbackModel !== primaryModel) modelsToTry.push(fallbackModel);
+  const modelNames = [primaryModel];
+  if (fallbackModel && fallbackModel !== primaryModel) modelNames.push(fallbackModel);
+
+  const attempts = [];
+  for (const modelName of modelNames) {
+    if (groundingAllowed) attempts.push({ modelName, useGrounding: true });
+    attempts.push({ modelName, useGrounding: false });
+  }
 
   let lastError = null;
-  for (let attempt = 0; attempt < modelsToTry.length; attempt += 1) {
-    const modelName = modelsToTry[attempt];
+  for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
+    const attempt = attempts[attemptIndex];
+    const promptForAttempt = searchRequested && !attempt.useGrounding
+      ? systemPrompt + "\n\nLIVE WEB SEARCH LIMITATION: This response does not have live web-search grounding. Do not claim you searched the web, do not invent current facts or citations, and clearly disclose when an answer would need live verification."
+      : systemPrompt;
+    const requestBody = websiteGeminiMessages(body, promptForAttempt);
+    requestBody.generationConfig = generationConfig;
+    if (attempt.useGrounding) requestBody.tools = [{ google_search: {} }];
+
     try {
-      const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
+      const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(attempt.modelName) + ":generateContent", {
         method: "POST",
         headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
         body: JSON.stringify(requestBody),
@@ -410,30 +422,34 @@ async function callWebsiteGemini(body, model, systemPrompt) {
         });
         console.warn("[WEBSITE_GEMINI]", JSON.stringify({
           selectedModel: model,
-          providerModel: modelName,
+          providerModel: attempt.modelName,
+          grounded: attempt.useGrounding,
           status: response.status,
-          fallbackAvailable: attempt < modelsToTry.length - 1
+          fallbackAvailable: attemptIndex < attempts.length - 1
         }));
         continue;
       }
 
       const content = extractGeminiContent(payload).trim();
       if (!content) {
-        lastError = Object.assign(new Error("Gemini returned an empty response for " + modelName + "."), { status: 502 });
+        lastError = Object.assign(new Error("Gemini returned an empty response for " + attempt.modelName + "."), { status: 502 });
         continue;
       }
+
       const groundedChunks = payload?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
       const sources = groundedChunks
         .map((chunk) => ({ title: chunk?.web?.title || "Web source", uri: chunk?.web?.uri || "" }))
         .filter((item) => item.uri)
         .slice(0, 12);
+
       return {
         brand: model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER",
         provider: "Gemini API",
         selectedProvider: "Gemini API",
         selectedModel: model,
-        model: modelName,
-        fallbackUsed: attempt > 0,
+        model: attempt.modelName,
+        fallbackUsed: attemptIndex > 0,
+        searchUnavailable: searchRequested && (!attempt.useGrounding || sources.length === 0),
         content,
         thinkingSummary: "",
         sources,
@@ -443,12 +459,14 @@ async function callWebsiteGemini(body, model, systemPrompt) {
       lastError = Object.assign(new Error(String(error?.message || error).slice(0, 300)), { status: 502 });
       console.warn("[WEBSITE_GEMINI]", JSON.stringify({
         selectedModel: model,
-        providerModel: modelName,
+        providerModel: attempt.modelName,
+        grounded: attempt.useGrounding,
         timedOut: error?.name === "TimeoutError" || error?.name === "AbortError",
-        fallbackAvailable: attempt < modelsToTry.length - 1
+        fallbackAvailable: attemptIndex < attempts.length - 1
       }));
     }
   }
+
   throw lastError || Object.assign(new Error("Gemini did not return a response."), { status: 502 });
 }
 
@@ -788,6 +806,7 @@ const server = http.createServer(async (req, res) => {
       model: activeProvider.model,
       models: websiteModels,
       geminiCodeProConfigured,
+      geminiSearchGroundingEnabled: GEMINI_SEARCH_GROUNDING_ENABLED,
       cloudflareTokenConfigured,
       groqFallbackConfigured,
       // Legacy clients use this as a gateway-ready flag; the explicit field above
