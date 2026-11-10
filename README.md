@@ -4,10 +4,9 @@ A Node.js HTTP gateway for IsaiahAI CodePro. It keeps provider credentials on th
 
 ## Providers
 
-The gateway tries providers in this order:
+The desktop CodePro agent tries providers in this order: Gemini (when `GEMINI_API_KEY_CODEPRO` is configured), Cloudflare Workers AI, then Groq. The website model routes are also hosted here: IsaiahAI 5.3 Flash, Isaiah Max 6.0, IsaiahAI 7.0 SUPER, and CodePro use separate Gemini key slots. Open-Isaiah uses a configurable external key-pool service and an OpenAI-compatible chat endpoint.
 
-1. **Cloudflare Workers AI** — primary provider when `CLOUDFLARE_API_TOKEN` is set, using `@cf/zai-org/glm-4.7-flash` by default.
-2. **Groq** — automatic fallback when Cloudflare is not configured or its request fails. The default fallback model is `openai/gpt-oss-120b`.
+The default Gemini models are `gemini-3.5-flash-lite` for IsaiahAI 5.3 Flash and `gemini-3.8-flash` for Isaiah Max 6.0, 7.0 SUPER, and CodePro. Thinking mode supports low, medium, and high effort for supported Gemini 3 models. Automatic mode leaves the provider's dynamic thinking enabled.
 
 At least one provider key must be configured. For reliable service, configure both. All credentials belong in Railway's private Variables panel (or a local untracked `.env` file for development), never in Git, the desktop installer, or the renderer.
 
@@ -17,6 +16,14 @@ This repository is connected to the Railway service `codepro-gateway`.
 
 Configure these private Railway variables:
 
+- `GEMINI_API_KEY_53_60`: private Gemini key for IsaiahAI 5.3 Flash and Isaiah Max 6.0.
+- `GEMINI_API_KEY_70`: private Gemini key for IsaiahAI 7.0 SUPER.
+- `GEMINI_API_KEY_CODEPRO`: private Gemini key for the CodePro Windows agent.
+- `GEMINI_53_MODEL`, `GEMINI_60_70_MODEL`, `GEMINI_CODEPRO_MODEL`: optional model identifiers; defaults are listed above.
+- `OPEN_ISAIAH_KEYS_URL`: HTTPS endpoint returning a JSON array of API keys, or `{ "keys": [...] }`, for the Open-Isaiah pool.
+- `OPEN_ISAIAH_API_URL`: HTTPS OpenAI-compatible `/chat/completions`-style endpoint used with a key returned above.
+- `OPEN_ISAIAH_KEYS_TOKEN`: optional bearer token required to fetch the key pool.
+- `OPEN_ISAIAH_MODEL`: optional upstream model name; defaults to `open-isaiah`.
 - `CLOUDFLARE_API_TOKEN`: Cloudflare API token with permission to run Workers AI models.
 - `CLOUDFLARE_ACCOUNT_ID`: 32-character Cloudflare account ID.
 - `CLOUDFLARE_MODEL`: optional; defaults to `@cf/zai-org/glm-4.7-flash`.
