@@ -382,7 +382,8 @@ async function callWebsiteGemini(body, model, systemPrompt) {
     temperature: model === "isaiah_5_3" ? 0.65 : 0.45
   };
   if (thinking.mode === "thinking") {
-    generationConfig.thinkingConfig = { thinkingLevel: thinking.effort.toUpperCase() };
+    // 7.0 SUPER uses a lighter reasoning pass for noticeably faster everyday replies.
+    generationConfig.thinkingConfig = { thinkingLevel: model === "isaiahai_7_super" ? "LOW" : thinking.effort.toUpperCase() };
   }
 
   const searchRequested = body.searchWebEnabled === true;
@@ -482,57 +483,118 @@ function extractOpenIsaiahKeys(payload) {
     .map((value) => value.trim());
 }
 
-async function handleOpenIsaiah(body) {
-  const keysUrl = String(process.env.OPEN_ISAIAH_KEYS_URL || "").trim();
-  const endpoint = String(process.env.OPEN_ISAIAH_API_URL || "").trim();
-  if (!keysUrl || !endpoint) {
-    throw Object.assign(new Error("Open-Isaiah needs OPEN_ISAIAH_KEYS_URL and OPEN_ISAIAH_API_URL configured as private Railway variables. These are the website endpoint that returns free keys and the Open-Isaiah chat API endpoint."), { status: 503 });
+async function handleOpenIsaiah(body, res) {
+  const apiKey = String(process.env.OPENROUTER_API_KEY || "").trim();
+  if (!apiKey) {
+    throw Object.assign(new Error("Open-Isaiah needs OPENROUTER_API_KEY configured as a private Railway variable. Create an OpenRouter API key and add it to the codepro-gateway service; the key is never placed in the website or app."), { status: 503 });
   }
-  let parsedKeysUrl, parsedEndpoint;
-  try {
-    parsedKeysUrl = new URL(keysUrl);
-    parsedEndpoint = new URL(endpoint);
-    if (parsedKeysUrl.protocol !== "https:" || parsedEndpoint.protocol !== "https:") throw new Error("HTTPS is required.");
-  } catch {
-    throw Object.assign(new Error("Open-Isaiah endpoints must be valid HTTPS URLs."), { status: 503 });
-  }
-  const keyHeaders = { "Accept": "application/json" };
-  const keysToken = String(process.env.OPEN_ISAIAH_KEYS_TOKEN || "").trim();
-  if (keysToken) keyHeaders.Authorization = "Bearer " + keysToken;
-  const keysResponse = await fetch(parsedKeysUrl, { headers: keyHeaders, cache: "no-store", signal: AbortSignal.timeout(8000) });
-  const keyPayload = await keysResponse.json().catch(() => ({}));
-  if (!keysResponse.ok) throw Object.assign(new Error("Open-Isaiah key service returned HTTP " + keysResponse.status + "."), { status: 502 });
-  const keys = extractOpenIsaiahKeys(keyPayload);
-  if (!keys.length) throw Object.assign(new Error("The Open-Isaiah key service did not return any usable API keys."), { status: 503 });
-  const key = keys[openIsaiahKeyCursor++ % keys.length];
-  const model = String(process.env.OPEN_ISAIAH_MODEL || "open-isaiah").trim();
+  const endpoint = String(process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1/chat/completions").trim();
+  const model = String(process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-5.5").trim();
   const system = String(body.systemInstruction || defaultWebsitePrompt("open_isaiah"));
   const messages = [
     { role: "system", content: system },
-    ...(Array.isArray(body.history) ? body.history.slice(-24).filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").map((item) => ({ role: item.role, content: item.content })) : []),
+    ...(Array.isArray(body.history) ? body.history.slice(-24).filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").map((item) => ({ role: item.role, content: item.content })) : [])
   ];
   const message = String(body.message || "").trim();
   if (message && !(messages[messages.length - 1]?.role === "user" && messages[messages.length - 1]?.content === message)) messages.push({ role: "user", content: message });
   if (messages.length < 2) throw Object.assign(new Error("Type a message to start chatting."), { status: 400 });
-  const response = await fetch(parsedEndpoint, {
+
+  const wantsStream = body.stream === true;
+  const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "Authorization": "Bearer " + key, "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify({ model, messages, stream: false, temperature: 0.6 }),
-    signal: AbortSignal.timeout(60000)
+    headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json", "Accept": wantsStream ? "text/event-stream" : "application/json", "HTTP-Referer": "https://stamourelectronics-creator.github.io/", "X-Title": "IsaiahSearch - Open-Isaiah" },
+    body: JSON.stringify({ model, messages, stream: wantsStream, temperature: 0.5, max_tokens: 4096 }),
+    signal: AbortSignal.timeout(90000)
   });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw Object.assign(new Error(payload?.error?.message || payload?.message || ("OpenRouter request failed (" + response.status + ").")), { status: response.status >= 500 ? 502 : response.status });
+  }
+
+  if (wantsStream) {
+    res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": "*" });
+    res.flushHeaders?.();
+    sendEvent(res, "status", { status: "writing", message: "Open-Isaiah is writing…" });
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let splitAt;
+      while ((splitAt = buffer.indexOf("\\n\\n")) !== -1) {
+        const frame = buffer.slice(0, splitAt);
+        buffer = buffer.slice(splitAt + 2);
+        const dataLine = frame.split("\\n").find((line) => line.startsWith("data:"));
+        if (!dataLine) continue;
+        const raw = dataLine.slice(5).trim();
+        if (!raw || raw === "[DONE]") continue;
+        let packet; try { packet = JSON.parse(raw); } catch { continue; }
+        const delta = normalizeModelContent(packet?.choices?.[0]?.delta?.content ?? packet?.choices?.[0]?.message?.content);
+        if (delta) { fullText += delta; sendEvent(res, "delta", { text: delta }); }
+      }
+    }
+    sendEvent(res, "done", { brand: "Open-Isaiah", provider: "OpenRouter", selectedProvider: "OpenRouter", selectedModel: "open_isaiah", model, content: fullText });
+    return;
+  }
+
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw Object.assign(new Error(payload?.error?.message || payload?.message || ("Open-Isaiah API request failed (" + response.status + ").")), { status: response.status >= 500 ? 502 : response.status });
   const content = normalizeModelContent(payload?.choices?.[0]?.message?.content ?? payload?.response ?? payload?.output_text ?? payload?.text).trim();
   if (!content) throw Object.assign(new Error("Open-Isaiah returned an empty response."), { status: 502 });
-  return { brand: "Open-Isaiah", provider: "Open-Isaiah", selectedProvider: "Open-Isaiah", selectedModel: "open_isaiah", model: payload?.model || model, content, sources: [], usage: payload?.usage || null };
+  return { brand: "Open-Isaiah", provider: "OpenRouter", selectedProvider: "OpenRouter", selectedModel: "open_isaiah", model: payload?.model || model, content, sources: [], usage: payload?.usage || null };
+}
+
+async function streamWebsiteGemini(body, model, systemPrompt, res) {
+  const apiKey = getWebsiteGeminiKey(model);
+  if (!apiKey) throw Object.assign(new Error("The selected model is not configured."), { status: 503 });
+  const providerModel = geminiModelForWebsite(model);
+  const prompt = model === "isaiahai_7_super"
+    ? { ...websiteGeminiMessages(body, systemPrompt), generationConfig: { maxOutputTokens: 8192, temperature: 0.45, thinkingConfig: { thinkingLevel: "LOW" } } }
+    : { ...websiteGeminiMessages(body, systemPrompt), generationConfig: { maxOutputTokens: model === "isaiah_5_3" ? 4096 : 8192, temperature: model === "isaiah_5_3" ? 0.65 : 0.45 } };
+  const upstream = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(providerModel) + ":streamGenerateContent?alt=sse", {
+    method: "POST", headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "text/event-stream" },
+    body: JSON.stringify(prompt), signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS)
+  });
+  if (!upstream.ok) {
+    const payload = await upstream.json().catch(() => ({}));
+    throw Object.assign(new Error(providerErrorMessage("Gemini", payload, upstream.status)), { status: upstream.status >= 500 ? 502 : upstream.status });
+  }
+  res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": "*" });
+  res.flushHeaders?.();
+  sendEvent(res, "status", { status: "writing", message: "Writing response…" });
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let splitAt;
+    while ((splitAt = buffer.indexOf("\\n\\n")) !== -1) {
+      const frame = buffer.slice(0, splitAt);
+      buffer = buffer.slice(splitAt + 2);
+      const dataLine = frame.split("\\n").find((line) => line.startsWith("data:"));
+      if (!dataLine) continue;
+      let packet; try { packet = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
+      const delta = extractGeminiContent(packet);
+      if (delta) { fullText += delta; sendEvent(res, "delta", { text: delta }); }
+    }
+  }
+  sendEvent(res, "done", { brand: model === "isaiahai_7_super" ? "IsaiahAI 7.0 SUPER" : "IsaiahAI", provider: "Gemini API", model: providerModel, content: fullText });
 }
 
 async function handleWebsiteModel(req, res, body, model) {
   if (model === "open_isaiah") {
-    const result = await handleOpenIsaiah(body);
+    const result = await handleOpenIsaiah(body, res);
+    if (body.stream === true) return;
     return sendJson(res, 200, result);
   }
-  const result = await callWebsiteGemini(body, model, String(body.systemInstruction || defaultWebsitePrompt(model)));
+  const systemPrompt = String(body.systemInstruction || defaultWebsitePrompt(model));
+  if (body.stream === true) return streamWebsiteGemini(body, model, systemPrompt, res);
+  const result = await callWebsiteGemini(body, model, systemPrompt);
   return sendJson(res, 200, result);
 }
 
@@ -791,7 +853,7 @@ const server = http.createServer(async (req, res) => {
       isaiah_5_3: Boolean(process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY),
       isaiah_max_6_0: Boolean(process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY),
       isaiahai_7_super: Boolean(process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY),
-      open_isaiah: Boolean(process.env.OPEN_ISAIAH_KEYS_URL && process.env.OPEN_ISAIAH_API_URL),
+      open_isaiah: Boolean(process.env.OPENROUTER_API_KEY),
       isaiah_codepro: providerReady
     };
 
@@ -807,6 +869,8 @@ const server = http.createServer(async (req, res) => {
       models: websiteModels,
       geminiCodeProConfigured,
       geminiSearchGroundingEnabled: GEMINI_SEARCH_GROUNDING_ENABLED,
+      openIsaiahProvider: "OpenRouter",
+      openIsaiahModel: process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-5.5",
       cloudflareTokenConfigured,
       groqFallbackConfigured,
       // Legacy clients use this as a gateway-ready flag; the explicit field above
