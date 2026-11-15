@@ -299,6 +299,9 @@ async function handleBreakaway(req, res, body) {
 let openIsaiahKeyCursor = 0;
 
 function getWebsiteGeminiKey(model) {
+  if (model === "open_isaiah") {
+    return String(process.env.OPEN_ISAIAH_API_KEY || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY || "").trim();
+  }
   if (model === "isaiah_5_3" || model === "isaiah_max_6_0") {
     return String(process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY || "").trim();
   }
@@ -328,6 +331,7 @@ function defaultWebsitePrompt(model) {
 }
 
 function geminiModelForWebsite(model) {
+  if (model === "open_isaiah") return String(process.env.OPEN_ISAIAH_GEMINI_MODEL || GEMINI_60_70_MODEL).trim();
   if (model === "isaiah_5_3") return GEMINI_53_MODEL;
   if (model === "isaiah_max_6_0" || model === "isaiahai_7_super") return GEMINI_60_70_MODEL;
   return GEMINI_CODEPRO_MODEL;
@@ -484,6 +488,12 @@ function extractOpenIsaiahKeys(payload) {
 }
 
 async function handleOpenIsaiah(body, res) {
+  const provider = String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase();
+  if (provider === "gemini") {
+    const systemPrompt = String(body.systemInstruction || defaultWebsitePrompt("open_isaiah"));
+    if (body.stream === true) return await streamWebsiteGemini(body, "open_isaiah", systemPrompt, res);
+    return await callWebsiteGemini(body, "open_isaiah", systemPrompt);
+  }
   const apiKey = String(process.env.OPENROUTER_API_KEY || "").trim();
   if (!apiKey) {
     throw Object.assign(new Error("Open-Isaiah needs OPENROUTER_API_KEY configured as a private Railway variable. Create an OpenRouter API key and add it to the codepro-gateway service; the key is never placed in the website or app."), { status: 503 });
@@ -853,7 +863,9 @@ const server = http.createServer(async (req, res) => {
       isaiah_5_3: Boolean(process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY),
       isaiah_max_6_0: Boolean(process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY),
       isaiahai_7_super: Boolean(process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY),
-      open_isaiah: Boolean(process.env.OPENROUTER_API_KEY),
+      open_isaiah: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini"
+        ? Boolean(process.env.OPEN_ISAIAH_API_KEY || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY)
+        : Boolean(process.env.OPENROUTER_API_KEY),
       isaiah_codepro: providerReady
     };
 
@@ -869,8 +881,10 @@ const server = http.createServer(async (req, res) => {
       models: websiteModels,
       geminiCodeProConfigured,
       geminiSearchGroundingEnabled: GEMINI_SEARCH_GROUNDING_ENABLED,
-      openIsaiahProvider: "OpenRouter",
-      openIsaiahModel: process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-5.5",
+      openIsaiahProvider: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini" ? "Gemini API" : "OpenRouter",
+      openIsaiahModel: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini"
+        ? String(process.env.OPEN_ISAIAH_GEMINI_MODEL || GEMINI_60_70_MODEL)
+        : (process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-5.5"),
       cloudflareTokenConfigured,
       groqFallbackConfigured,
       // Legacy clients use this as a gateway-ready flag; the explicit field above
