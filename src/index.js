@@ -374,7 +374,7 @@ function websiteGeminiMessages(body, systemPrompt) {
 
 async function createIsaiahSuperThinkingSummary(body, answer, apiKey) {
   if (body.showThinking !== true || !apiKey) return "";
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_FALLBACK_MODEL).trim();
   try {
     const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
       method: "POST",
@@ -838,7 +838,7 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
     instruction + "\n\nUser query: " + String(query || "").slice(0, 2000) +
     (previous ? "\n\nPrevious overview:\n" + previous : "") +
     "\n\nActual search results returned by IsaiahSearch:\n" + sourceText;
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_FALLBACK_MODEL).trim();
   const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
     method: "POST",
     headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
@@ -924,7 +924,7 @@ async function streamIsaiahSearchSummary(req, res, body) {
     query.slice(0, 2000) + ". Previous overview: " + String(body.previousSummary || "").slice(0, 4500) +
     "\n\nUse these actual IsaiahSearch results as evidence: " + JSON.stringify(sources) +
     "\n\nInclude an executive summary, key findings, source-supported details, limitations, and next questions. Link claims to these source URLs. Never invent facts or citations.";
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_FALLBACK_MODEL).trim();
   let upstream;
   try {
     upstream = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":streamGenerateContent?alt=sse", {
