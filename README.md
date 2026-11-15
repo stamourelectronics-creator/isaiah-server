@@ -23,10 +23,10 @@ Configure these private Railway variables:
 - `GEMINI_FALLBACK_MODEL`: optional shared fallback model; defaults to `gemini-3.5-flash`.
 - `GEMINI_REQUEST_TIMEOUT_MS`: optional per-model attempt timeout in milliseconds; defaults to `20000` and is clamped between 10000 and 60000.
 - `GEMINI_SEARCH_GROUNDING_ENABLED`: defaults to `false` so chats work with standard free-tier keys. Set to `true` only when the Gemini account tier has Google Search grounding access. When disabled, the API returns a normal model answer with `searchUnavailable: true`; the website tells users the answer has no live web verification.
-- `OPEN_ISAIAH_KEYS_URL`: HTTPS endpoint returning a JSON array of API keys, or `{ "keys": [...] }`, for the Open-Isaiah pool.
-- `OPEN_ISAIAH_API_URL`: HTTPS OpenAI-compatible `/chat/completions`-style endpoint used with a key returned above.
-- `OPEN_ISAIAH_KEYS_TOKEN`: optional bearer token required to fetch the key pool.
-- `OPEN_ISAIAH_MODEL`: optional upstream model name; defaults to `open-isaiah`.
+- `OPEN_ISAIAH_PROVIDER`: set to `gemini` to run Open-Isaiah through the existing private Gemini model-key slots; set to `openrouter` to use the OpenRouter path.
+- `OPEN_ISAIAH_API_KEY`: optional dedicated private key for Open-Isaiah. When omitted in Gemini mode, the gateway reuses `GEMINI_API_KEY_70`, then `GEMINI_API_KEY_53_60`, then `GEMINI_API_KEY`.
+- `OPEN_ISAIAH_GEMINI_MODEL`: optional Gemini model override for Open-Isaiah; defaults to the configured Isaiah Max / 7.0 model.
+- `OPEN_ISAIAH_API_URL`: optional Gemini API base URL for deployments that customize the upstream endpoint.
 - `CLOUDFLARE_API_TOKEN`: Cloudflare API token with permission to run Workers AI models.
 - `CLOUDFLARE_ACCOUNT_ID`: 32-character Cloudflare account ID.
 - `CLOUDFLARE_MODEL`: optional; defaults to `@cf/zai-org/glm-4.7-flash`.
