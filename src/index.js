@@ -235,7 +235,7 @@ function providerErrorMessage(provider, payload, status) {
       .map((item) => item?.message)
       .filter(Boolean)
       .join("; ");
-    return payload?.error?.message || detail || payload?.message || ("Gemini API request failed (" + status + ").");
+    "IsaiahAI could not complete this request. Please retry in a moment."
   }
   return payload?.error?.message || payload?.message || ("Groq request failed (" + status + ").");
 }
@@ -371,6 +371,33 @@ function websiteGeminiMessages(body, systemPrompt) {
   };
 }
 
+
+async function createIsaiahSuperThinkingSummary(body, answer, apiKey) {
+  if (body.showThinking !== true || !apiKey) return "";
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
+  try {
+    const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
+      method: "POST",
+      headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: "You are IsaiahAI 7.0 SUPER. Write a user-facing summary in 1–3 sentences. Never identify as Gemini, Google, OpenAI, or another provider. Do not reveal hidden chain-of-thought." }] },
+        contents: [{ role: "user", parts: [{ text: "Question:\n" + String(body.message || "").slice(0, 3500) + "\n\nAnswer:\n" + String(answer || "").slice(0, 5200) + "\n\nSummarize the main approach and important factors, without private internal reasoning." }] }],
+        generationConfig: { maxOutputTokens: 220, temperature: 0.2 }
+      }),
+      signal: AbortSignal.timeout(14000)
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      console.warn("[ISAIAH_SUPER_SUMMARY]", JSON.stringify({ status: response.status }));
+      return "";
+    }
+    return extractGeminiContent(payload).trim();
+  } catch (error) {
+    console.warn("[ISAIAH_SUPER_SUMMARY]", JSON.stringify({ failed: true, reason: String(error?.message || error).slice(0, 120) }));
+    return "";
+  }
+}
+
 async function callWebsiteGemini(body, model, systemPrompt) {
   const apiKey = getWebsiteGeminiKey(model);
   if (!apiKey) {
@@ -447,16 +474,19 @@ async function callWebsiteGemini(body, model, systemPrompt) {
         .filter((item) => item.uri)
         .slice(0, 12);
 
+      const thinkingSummary = model === "isaiahai_7_super" && body.showThinking === true
+        ? await createIsaiahSuperThinkingSummary(body, content, apiKey)
+        : "";
       return {
         brand: model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER",
-        provider: "Gemini API",
-        selectedProvider: "Gemini API",
+        provider: "IsaiahAI",
+        selectedProvider: "IsaiahAI",
         selectedModel: model,
         model: attempt.modelName,
         fallbackUsed: attemptIndex > 0,
         searchUnavailable: searchRequested && (!attempt.useGrounding || sources.length === 0),
         content,
-        thinkingSummary: "",
+        thinkingSummary,
         sources,
         usage: payload?.usageMetadata || null
       };
@@ -593,7 +623,7 @@ async function streamWebsiteGemini(body, model, systemPrompt, res) {
       if (delta) { fullText += delta; sendEvent(res, "delta", { text: delta }); }
     }
   }
-  sendEvent(res, "done", { brand: model === "isaiahai_7_super" ? "IsaiahAI 7.0 SUPER" : "IsaiahAI", provider: "Gemini API", model: providerModel, content: fullText });
+  sendEvent(res, "done", { brand: model === "isaiahai_7_super" ? "IsaiahAI 7.0 SUPER" : "IsaiahAI", provider: "IsaiahAI", model: providerModel, content: fullText });
 }
 
 async function handleWebsiteModel(req, res, body, model) {
