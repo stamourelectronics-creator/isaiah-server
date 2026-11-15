@@ -21,6 +21,7 @@ Configure these private Railway variables:
 - `GEMINI_API_KEY_CODEPRO`: private Gemini key for the CodePro Windows agent.
 - `GEMINI_53_MODEL`, `GEMINI_60_70_MODEL`, `GEMINI_CODEPRO_MODEL`: optional model identifiers; defaults are listed above.
 - `GEMINI_FALLBACK_MODEL`: optional shared fallback model; defaults to `gemini-3.5-flash`.
+- `ISAIAH_SUPER_SUMMARY_MODEL`: optional separate fast Flash model for IsaiahAI 7.0 SUPER Search Assist overviews and reasoning summaries; defaults to `GEMINI_FALLBACK_MODEL`.
 - `GEMINI_REQUEST_TIMEOUT_MS`: optional per-model attempt timeout in milliseconds; defaults to `20000` and is clamped between 10000 and 60000.
 - `GEMINI_SEARCH_GROUNDING_ENABLED`: defaults to `false` so chats work with standard free-tier keys. Set to `true` only when the Gemini account tier has Google Search grounding access. When disabled, the API returns a normal model answer with `searchUnavailable: true`; the website tells users the answer has no live web verification.
 - `OPEN_ISAIAH_PROVIDER`: set to `gemini` to run Open-Isaiah through the existing private Gemini model-key slots; set to `openrouter` to use the OpenRouter path.
