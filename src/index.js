@@ -933,10 +933,10 @@ async function streamIsaiahSearchSummary(req, res, body) {
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     let splitAt;
-    while ((splitAt = buffer.indexOf("\\n\\n")) !== -1) {
+    while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
       const frame = buffer.slice(0, splitAt);
       buffer = buffer.slice(splitAt + 2);
-      const dataLine = frame.split("\\n").find((line) => line.startsWith("data:"));
+      const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
       if (!dataLine) continue;
       const raw = dataLine.slice(5).trim();
       if (!raw || raw === "[DONE]") continue;
@@ -947,7 +947,7 @@ async function streamIsaiahSearchSummary(req, res, body) {
     }
   }
   if (buffer.trim()) {
-    const dataLine = buffer.split("\\n").find((line) => line.startsWith("data:"));
+    const dataLine = buffer.split("\n").find((line) => line.startsWith("data:"));
     if (dataLine) {
       try {
         const packet = JSON.parse(dataLine.slice(5).trim());
@@ -1255,7 +1255,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  if (req.method !== "POST" || !["/api/chat", "/api/agent", "/api/breakaway"].includes(url.pathname)) {
+  if (req.method !== "POST" || !["/api/chat", "/api/agent", "/api/breakaway", "/api/quick-search-links", "/api/more-search-links", "/api/search-summary-brief", "/api/search-summary-more", "/api/search-summary-more-stream"].includes(url.pathname)) {
     return sendJson(res, 404, { error: "Not found." });
   }
 
@@ -1264,6 +1264,26 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const body = await readJson(req);
+    if (url.pathname === "/api/quick-search-links") {
+      await handleQuickSearch(req, res, body, false);
+      return;
+    }
+    if (url.pathname === "/api/more-search-links") {
+      await handleQuickSearch(req, res, body, true);
+      return;
+    }
+    if (url.pathname === "/api/search-summary-brief") {
+      await handleIsaiahSearchSummary(req, res, body, false);
+      return;
+    }
+    if (url.pathname === "/api/search-summary-more") {
+      await handleIsaiahSearchSummary(req, res, body, true);
+      return;
+    }
+    if (url.pathname === "/api/search-summary-more-stream") {
+      await streamIsaiahSearchSummary(req, res, body);
+      return;
+    }
     if (url.pathname === "/api/breakaway") {
       await handleBreakaway(req, res, body);
       return;
