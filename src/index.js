@@ -235,7 +235,7 @@ function providerErrorMessage(provider, payload, status) {
       .map((item) => item?.message)
       .filter(Boolean)
       .join("; ");
-    return payload?.error?.message || detail || payload?.message || ("Gemini API request failed (" + status + ").");
+    "IsaiahAI could not complete this request. Please retry in a moment."
   }
   return payload?.error?.message || payload?.message || ("Groq request failed (" + status + ").");
 }
@@ -371,6 +371,33 @@ function websiteGeminiMessages(body, systemPrompt) {
   };
 }
 
+
+async function createIsaiahSuperThinkingSummary(body, answer, apiKey) {
+  if (body.showThinking !== true || !apiKey) return "";
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
+  try {
+    const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
+      method: "POST",
+      headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: "You are IsaiahAI 7.0 SUPER. Write a user-facing summary in 1–3 sentences. Never identify as Gemini, Google, OpenAI, or another provider. Do not reveal hidden chain-of-thought." }] },
+        contents: [{ role: "user", parts: [{ text: "Question:\n" + String(body.message || "").slice(0, 3500) + "\n\nAnswer:\n" + String(answer || "").slice(0, 5200) + "\n\nSummarize the main approach and important factors, without private internal reasoning." }] }],
+        generationConfig: { maxOutputTokens: 220, temperature: 0.2 }
+      }),
+      signal: AbortSignal.timeout(14000)
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      console.warn("[ISAIAH_SUPER_SUMMARY]", JSON.stringify({ status: response.status }));
+      return "";
+    }
+    return extractGeminiContent(payload).trim();
+  } catch (error) {
+    console.warn("[ISAIAH_SUPER_SUMMARY]", JSON.stringify({ failed: true, reason: String(error?.message || error).slice(0, 120) }));
+    return "";
+  }
+}
+
 async function callWebsiteGemini(body, model, systemPrompt) {
   const apiKey = getWebsiteGeminiKey(model);
   if (!apiKey) {
@@ -447,16 +474,19 @@ async function callWebsiteGemini(body, model, systemPrompt) {
         .filter((item) => item.uri)
         .slice(0, 12);
 
+      const thinkingSummary = model === "isaiahai_7_super" && body.showThinking === true
+        ? await createIsaiahSuperThinkingSummary(body, content, apiKey)
+        : "";
       return {
         brand: model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER",
-        provider: "Gemini API",
-        selectedProvider: "Gemini API",
+        provider: "IsaiahAI",
+        selectedProvider: "IsaiahAI",
         selectedModel: model,
         model: attempt.modelName,
         fallbackUsed: attemptIndex > 0,
         searchUnavailable: searchRequested && (!attempt.useGrounding || sources.length === 0),
         content,
-        thinkingSummary: "",
+        thinkingSummary,
         sources,
         usage: payload?.usageMetadata || null
       };
@@ -593,7 +623,7 @@ async function streamWebsiteGemini(body, model, systemPrompt, res) {
       if (delta) { fullText += delta; sendEvent(res, "delta", { text: delta }); }
     }
   }
-  sendEvent(res, "done", { brand: model === "isaiahai_7_super" ? "IsaiahAI 7.0 SUPER" : "IsaiahAI", provider: "Gemini API", model: providerModel, content: fullText });
+  sendEvent(res, "done", { brand: model === "isaiahai_7_super" ? "IsaiahAI 7.0 SUPER" : "IsaiahAI", provider: "IsaiahAI", model: providerModel, content: fullText });
 }
 
 async function handleWebsiteModel(req, res, body, model) {
@@ -606,6 +636,358 @@ async function handleWebsiteModel(req, res, body, model) {
   if (body.stream === true) return streamWebsiteGemini(body, model, systemPrompt, res);
   const result = await callWebsiteGemini(body, model, systemPrompt);
   return sendJson(res, 200, result);
+}
+
+
+
+function decodeSearchEntities(value) {
+  return String(value || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#(\d+);/g, (_match, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code) => String.fromCodePoint(parseInt(code, 16)));
+}
+
+function stripSearchMarkup(value) {
+  return decodeSearchEntities(String(value || "")
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " "))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function searchHrefFromTag(tagAttributes) {
+  const match = String(tagAttributes || "").match(/\bhref\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/i);
+  return decodeSearchEntities(match ? (match[1] || match[2] || match[3] || "") : "");
+}
+
+function normalizeExternalSearchUrl(rawHref, engine) {
+  let href = decodeSearchEntities(String(rawHref || "").trim());
+  if (!href) return "";
+  try {
+    const parsed = new URL(href.startsWith("//") ? "https:" + href : href, "https://www." + engine + ".com");
+    const redirected = parsed.searchParams.get("uddg") || parsed.searchParams.get("url") || parsed.searchParams.get("q");
+    if (redirected && (parsed.hostname.includes("duckduckgo.com") || parsed.hostname.includes("google.") || parsed.hostname.includes("bing.com"))) {
+      href = redirected;
+    } else if (parsed.hostname.includes("google.") && parsed.pathname === "/url") {
+      href = parsed.searchParams.get("q") || parsed.searchParams.get("url") || href;
+    }
+  } catch {}
+  try {
+    const url = new URL(href);
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    const host = url.hostname.toLowerCase();
+    if (/(\.|^)duckduckgo\.com$|(\.|^)google\.[a-z.]+$|(\.|^)bing\.com$|(\.|^)search\.brave\.com$/.test(host)) return "";
+    url.hash = "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function makeSearchResult(rawHref, titleMarkup, snippetMarkup, engine) {
+  const url = normalizeExternalSearchUrl(rawHref, engine);
+  const title = stripSearchMarkup(titleMarkup).slice(0, 240);
+  const snippet = stripSearchMarkup(snippetMarkup).slice(0, 700);
+  if (!url || !title) return null;
+  let siteName = "Web";
+  try { siteName = new URL(url).hostname.replace(/^www\./i, ""); } catch {}
+  return { title, url, snippet, siteName };
+}
+
+function parseDdgSearchHtml(html) {
+  const results = [];
+  const blocks = String(html || "").split(/<div\b[^>]*class=["'][^"']*\bresult\b[^"']*["'][^>]*>/i).slice(1);
+  for (const block of blocks) {
+    const linkMatch = block.match(/<a\b([^>]*class=["'][^"']*result__a[^"']*["'][^>]*)>([\s\S]*?)<\/a>/i)
+      || block.match(/<h2\b[^>]*>\s*<a\b([^>]*)>([\s\S]*?)<\/a>\s*<\/h2>/i);
+    if (!linkMatch) continue;
+    const rawHref = searchHrefFromTag(linkMatch[1]);
+    const snippetMatch = block.match(/<a\b([^>]*class=["'][^"']*result__snippet[^"']*["'][^>]*)>([\s\S]*?)<\/a>/i)
+      || block.match(/<div\b([^>]*class=["'][^"']*result__snippet[^"']*["'][^>]*)>([\s\S]*?)<\/div>/i);
+    const result = makeSearchResult(rawHref, linkMatch[2], snippetMatch?.[2] || "", "duckduckgo");
+    if (result) results.push(result);
+  }
+  return results;
+}
+
+function parseBingSearchHtml(html) {
+  const results = [];
+  const blocks = String(html || "").split(/<li\b[^>]*class=["'][^"']*b_algo[^"']*["'][^>]*>/i).slice(1);
+  for (const block of blocks) {
+    const linkMatch = block.match(/<h2\b[^>]*>\s*<a\b([^>]*)>([\s\S]*?)<\/a>\s*<\/h2>/i);
+    if (!linkMatch) continue;
+    const snippetMatch = block.match(/<p\b[^>]*>([\s\S]*?)<\/p>/i);
+    const result = makeSearchResult(searchHrefFromTag(linkMatch[1]), linkMatch[2], snippetMatch?.[1] || "", "bing");
+    if (result) results.push(result);
+  }
+  return results;
+}
+
+function parseGoogleSearchHtml(html) {
+  const results = [];
+  const linkMatches = String(html || "").matchAll(/<a\b([^>]*)>([\s\S]*?<h3\b[^>]*>[\s\S]*?<\/h3>[\s\S]*?)<\/a>/gi);
+  for (const match of linkMatches) {
+    const titleMatch = match[2].match(/<h3\b[^>]*>([\s\S]*?)<\/h3>/i);
+    if (!titleMatch) continue;
+    const result = makeSearchResult(searchHrefFromTag(match[1]), titleMatch[1], "", "google");
+    if (result) results.push(result);
+  }
+  return results;
+}
+
+function parseBraveSearchHtml(html) {
+  const results = [];
+  const linkMatches = String(html || "").matchAll(/<a\b([^>]*class=["'][^"']*result-header[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi);
+  for (const match of linkMatches) {
+    const result = makeSearchResult(searchHrefFromTag(match[1]), match[2], "", "brave");
+    if (result) results.push(result);
+  }
+  return results;
+}
+
+async function fetchSearchPage(engine, query, offset, safeSearch) {
+  const safeMode = String(safeSearch || "Moderate").toLowerCase();
+  const start = Math.max(0, Number(offset) || 0);
+  let url = "";
+  if (engine === "duckduckgo") {
+    const kp = safeMode === "strict" ? "1" : safeMode === "off" ? "-2" : "-1";
+    url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query) + "&kp=" + kp + (start ? "&s=" + start : "");
+  } else if (engine === "bing") {
+    url = "https://www.bing.com/search?q=" + encodeURIComponent(query) + "&setlang=en&first=" + (start + 1);
+  } else if (engine === "google") {
+    url = "https://www.google.com/search?q=" + encodeURIComponent(query) + "&hl=en&gl=ca&num=20&start=" + start;
+  } else if (engine === "brave") {
+    url = "https://search.brave.com/search?q=" + encodeURIComponent(query) + "&source=web&page=" + (Math.floor(start / 20) + 1);
+  } else {
+    return [];
+  }
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 IsaiahSearch/1.5",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(7000)
+    });
+    if (!response.ok) return [];
+    const html = await response.text();
+    if (engine === "duckduckgo") return parseDdgSearchHtml(html);
+    if (engine === "bing") return parseBingSearchHtml(html);
+    if (engine === "google") return parseGoogleSearchHtml(html);
+    if (engine === "brave") return parseBraveSearchHtml(html);
+    return [];
+  } catch (error) {
+    console.warn("[ISAIAHSEARCH_WEB]", JSON.stringify({ engine, failed: true, reason: String(error?.message || error).slice(0, 140) }));
+    return [];
+  }
+}
+
+function mergeUniqueSearchResults(groups, limit = 20) {
+  const merged = [];
+  const seen = new Set();
+  for (const group of groups) {
+    for (const item of (Array.isArray(group) ? group : [])) {
+      const key = normalizeExternalSearchUrl(item?.url, "isaiah");
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      merged.push({ ...item, url: key });
+      if (merged.length >= limit) return merged;
+    }
+  }
+  return merged;
+}
+
+async function searchIsaiahWeb(query, engine, offset = 0, safeSearch = "Moderate") {
+  const selected = String(engine || "isaiah").toLowerCase();
+  const engines = selected === "isaiah" ? ["duckduckgo", "bing", "brave"] : [selected];
+  const groups = await Promise.all(engines.map((name) => fetchSearchPage(name, query, offset, safeSearch)));
+  let results = mergeUniqueSearchResults(groups, 20);
+  if (results.length < 6 && selected !== "google" && selected !== "bing") {
+    const fallbackEngine = selected === "isaiah" ? "google" : "bing";
+    const fallback = await fetchSearchPage(fallbackEngine, query, offset, safeSearch);
+    results = mergeUniqueSearchResults([results, fallback], 20);
+  }
+  return results;
+}
+
+async function generateIsaiahSuperSummary(query, results, options = {}) {
+  const apiKey = getWebsiteGeminiKey("isaiahai_7_super");
+  if (!apiKey) throw Object.assign(new Error("IsaiahAI 7.0 SUPER is not configured for Search Assist."), { status: 503 });
+  const detailed = options.detailed === true;
+  const sources = (Array.isArray(results) ? results : []).slice(0, detailed ? 14 : 8).map((item, index) => ({
+    number: index + 1,
+    title: String(item?.title || "Search result").slice(0, 180),
+    url: String(item?.url || "").slice(0, 500),
+    snippet: String(item?.snippet || "").slice(0, 700)
+  }));
+  const sourceText = JSON.stringify(sources);
+  const previous = String(options.previousSummary || "").slice(0, 4500);
+  const instruction = detailed
+    ? "Write a useful, well-structured research report in Markdown. Include an executive summary, important findings, what the sources agree or disagree on, limitations, and useful next questions. Link claims to the provided source URLs. Do not invent facts, quotations, citations, dates, or source content."
+    : "Write a direct, concise answer in 1–2 paragraphs, then add a few bullets only when helpful. Use the supplied source material and link important claims to the provided URLs. If the sources do not answer the query, say what remains uncertain. Do not invent facts or citations.";
+  const prompt = "You are IsaiahAI 7.0 SUPER Search Assist, part of IsaiahAI by St.Amour Electronics. Your visible identity is IsaiahAI 7.0 SUPER. Never identify yourself as Gemini, Google, OpenAI, or another provider. " +
+    instruction + "\n\nUser query: " + String(query || "").slice(0, 2000) +
+    (previous ? "\n\nPrevious overview:\n" + previous : "") +
+    "\n\nActual search results returned by IsaiahSearch:\n" + sourceText;
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
+  const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
+    method: "POST",
+    headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: "You are IsaiahAI 7.0 SUPER. Return only the requested answer. Be accurate, concise, and honest about uncertainty. Never reveal hidden chain-of-thought." }] },
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: detailed ? 4800 : 650, temperature: 0.25 }
+    }),
+    signal: AbortSignal.timeout(detailed ? 30000 : 14000)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw Object.assign(new Error(payload?.error?.message || "IsaiahAI 7.0 SUPER could not generate the search summary."), { status: response.status >= 500 ? 502 : response.status });
+  }
+  const summary = extractGeminiContent(payload).trim();
+  if (!summary) throw Object.assign(new Error("IsaiahAI 7.0 SUPER returned an empty Search Assist summary."), { status: 502 });
+  return summary;
+}
+
+async function handleQuickSearch(req, res, body, more = false) {
+  const query = String(body.query || "").trim();
+  if (!query) return sendJson(res, 400, { error: "Query is required." });
+  if (query.length > 500) return sendJson(res, 413, { error: "Search query is too long." });
+  const engine = String(body.engine || "isaiah").toLowerCase();
+  if (!["isaiah", "google", "bing", "brave", "duckduckgo"].includes(engine)) {
+    return sendJson(res, 400, { error: "Choose a supported IsaiahSearch engine." });
+  }
+  const offset = more ? Math.max(30, Number(body.offset) || 30) : 0;
+  const results = await searchIsaiahWeb(query, engine, offset, body.safeSearch || "Moderate");
+  return sendJson(res, 200, {
+    engineUsed: engine,
+    results,
+    images: [],
+    videos: [],
+    news: [],
+    offset,
+    hasMore: results.length > 0
+  });
+}
+
+async function handleIsaiahSearchSummary(req, res, body, detailed = false) {
+  const query = String(body.query || "").trim();
+  if (!query) return sendJson(res, 400, { error: "Query is required." });
+  if (String(body.model || "").toLowerCase() !== "isaiahai_7_super") {
+    return sendJson(res, 400, { error: "Search Assist summaries are available through IsaiahAI 7.0 SUPER." });
+  }
+  try {
+    const summary = await generateIsaiahSuperSummary(query, body.results, {
+      detailed,
+      previousSummary: body.previousSummary
+    });
+    return sendJson(res, 200, detailed
+      ? { moreSummary: summary, brand: "IsaiahAI 7.0 SUPER" }
+      : { summary, brand: "IsaiahAI 7.0 SUPER" });
+  } catch (error) {
+    console.warn("[ISAIAH_SEARCH_SUMMARY]", JSON.stringify({
+      selectedModel: "isaiahai_7_super",
+      detailed,
+      status: Number(error?.status || 0),
+      message: String(error?.message || error).slice(0, 180)
+    }));
+    return sendJson(res, error.status || 502, {
+      error: "IsaiahAI 7.0 SUPER could not complete the Search Assist summary. Please retry."
+    });
+  }
+}
+
+async function streamIsaiahSearchSummary(req, res, body) {
+  const query = String(body.query || "").trim();
+  if (!query) return sendJson(res, 400, { error: "Query is required." });
+  if (String(body.model || "").toLowerCase() !== "isaiahai_7_super") {
+    return sendJson(res, 400, { error: "Search Assist summaries are available through IsaiahAI 7.0 SUPER." });
+  }
+  const apiKey = getWebsiteGeminiKey("isaiahai_7_super");
+  if (!apiKey) return sendJson(res, 503, { error: "IsaiahAI 7.0 SUPER is not configured for Search Assist." });
+  const sources = (Array.isArray(body.results) ? body.results : []).slice(0, 14).map((item, index) => ({
+    number: index + 1,
+    title: String(item?.title || "Search result").slice(0, 180),
+    url: String(item?.url || "").slice(0, 500),
+    snippet: String(item?.snippet || "").slice(0, 700)
+  }));
+  const prompt = "You are IsaiahAI 7.0 SUPER Search Assist from St.Amour Electronics. Never identify as Gemini, Google, OpenAI, or another provider. The user wants a detailed but accurate Markdown research report about: " +
+    query.slice(0, 2000) + ". Previous overview: " + String(body.previousSummary || "").slice(0, 4500) +
+    "\n\nUse these actual IsaiahSearch results as evidence: " + JSON.stringify(sources) +
+    "\n\nInclude an executive summary, key findings, source-supported details, limitations, and next questions. Link claims to these source URLs. Never invent facts or citations.";
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
+  let upstream;
+  try {
+    upstream = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":streamGenerateContent?alt=sse", {
+      method: "POST",
+      headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: "You are IsaiahAI 7.0 SUPER. Return only the requested report in Markdown. Never reveal hidden chain-of-thought." }] },
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 4800, temperature: 0.3 }
+      }),
+      signal: AbortSignal.timeout(30000)
+    });
+    if (!upstream.ok) {
+      const payload = await upstream.json().catch(() => ({}));
+      throw Object.assign(new Error(payload?.error?.message || "Summary generation failed."), { status: upstream.status });
+    }
+  } catch (error) {
+    console.warn("[ISAIAH_SEARCH_SUMMARY_STREAM]", String(error?.message || error).slice(0, 160));
+    return sendJson(res, error.status || 502, { error: "IsaiahAI 7.0 SUPER could not generate the detailed report. Please retry." });
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin": "*"
+  });
+  res.flushHeaders?.();
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let splitAt;
+    while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, splitAt);
+      buffer = buffer.slice(splitAt + 2);
+      const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
+      if (!dataLine) continue;
+      const raw = dataLine.slice(5).trim();
+      if (!raw || raw === "[DONE]") continue;
+      let packet;
+      try { packet = JSON.parse(raw); } catch { continue; }
+      const delta = extractGeminiContent(packet);
+      if (delta) { fullText += delta; res.write(delta); }
+    }
+  }
+  if (buffer.trim()) {
+    const dataLine = buffer.split("\n").find((line) => line.startsWith("data:"));
+    if (dataLine) {
+      try {
+        const packet = JSON.parse(dataLine.slice(5).trim());
+        const delta = extractGeminiContent(packet);
+        if (delta) { fullText += delta; res.write(delta); }
+      } catch {}
+    }
+  }
+  if (!fullText.trim()) res.write("IsaiahAI 7.0 SUPER could not produce a detailed report for this request. Please retry.");
+  res.end();
 }
 
 async function handleAgent(req, res, body) {
@@ -903,7 +1285,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  if (req.method !== "POST" || !["/api/chat", "/api/agent", "/api/breakaway"].includes(url.pathname)) {
+  if (req.method !== "POST" || !["/api/chat", "/api/agent", "/api/breakaway", "/api/quick-search-links", "/api/more-search-links", "/api/search-summary-brief", "/api/search-summary-more", "/api/search-summary-more-stream"].includes(url.pathname)) {
     return sendJson(res, 404, { error: "Not found." });
   }
 
@@ -912,6 +1294,26 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const body = await readJson(req);
+    if (url.pathname === "/api/quick-search-links") {
+      await handleQuickSearch(req, res, body, false);
+      return;
+    }
+    if (url.pathname === "/api/more-search-links") {
+      await handleQuickSearch(req, res, body, true);
+      return;
+    }
+    if (url.pathname === "/api/search-summary-brief") {
+      await handleIsaiahSearchSummary(req, res, body, false);
+      return;
+    }
+    if (url.pathname === "/api/search-summary-more") {
+      await handleIsaiahSearchSummary(req, res, body, true);
+      return;
+    }
+    if (url.pathname === "/api/search-summary-more-stream") {
+      await streamIsaiahSearchSummary(req, res, body);
+      return;
+    }
     if (url.pathname === "/api/breakaway") {
       await handleBreakaway(req, res, body);
       return;
