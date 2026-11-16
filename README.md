@@ -4,11 +4,11 @@ A Node.js HTTP gateway for IsaiahAI CodePro. It keeps provider credentials on th
 
 ## Providers
 
-The desktop CodePro agent tries providers in this order: Gemini (when `GEMINI_API_KEY_CODEPRO` is configured), Cloudflare Workers AI, then Groq. The website model routes are also hosted here: IsaiahAI 5.3 Flash, Isaiah Max 6.0, IsaiahAI 7.0 SUPER, and CodePro use separate Gemini key slots. Open-Isaiah uses a configurable external key-pool service and an OpenAI-compatible chat endpoint.
+The CodePro agent uses Groq's `openai/gpt-oss-120b` as its primary model with high reasoning effort. When Groq is unavailable, it can fall back to Gemini (when `GEMINI_API_KEY_CODEPRO` is configured), then Cloudflare Workers AI (when both its token and account ID are configured). The `/api/agent` endpoint and `/api/chat` requests with `model: "isaiah_codepro"` use the same Groq-first agent pipeline. The website's other model routes are also hosted here: IsaiahAI 5.3 Flash, Isaiah Max 6.0, IsaiahAI 7.0 SUPER, and Open-Isaiah.
 
 The default Gemini models are `gemini-3.5-flash-lite` for IsaiahAI 5.3 Flash and `gemini-3.8-flash` for Isaiah Max 6.0, 7.0 SUPER, and CodePro. If a primary model stalls or fails, the gateway retries with `gemini-3.5-flash` by default. Each provider attempt has a bounded timeout (`GEMINI_REQUEST_TIMEOUT_MS`, 20 seconds by default). Thinking mode supports low, medium, and high effort for supported Gemini 3 models. Automatic mode leaves the provider's dynamic thinking enabled.
 
-At least one provider key must be configured. For reliable service, configure both. All credentials belong in Railway's private Variables panel (or a local untracked `.env` file for development), never in Git, the desktop installer, or the renderer.
+At least one CodePro provider must be configured. Configure Groq as the primary provider and an optional Gemini or Cloudflare fallback for resilience. GPT-OSS reasoning is requested at high effort, and reasoning tokens are not included in user-facing responses. The gateway does not provide hidden local computer-control tools; CodePro works from the files, context, and verified tool results explicitly supplied by its host application. All credentials belong in Railway's private Variables panel (or a local untracked `.env` file for development), never in Git, the desktop installer, or the renderer.
 
 ## Railway deployment
 
@@ -31,17 +31,18 @@ Configure these private Railway variables:
 - `CLOUDFLARE_API_TOKEN`: Cloudflare API token with permission to run Workers AI models.
 - `CLOUDFLARE_ACCOUNT_ID`: 32-character Cloudflare account ID.
 - `CLOUDFLARE_MODEL`: optional; defaults to `@cf/zai-org/glm-4.7-flash`.
-- `GROQ_API_KEY`: Groq API key used as an automatic fallback.
+- `GROQ_API_KEY`: private Groq API key; primary provider for IsaiahAI CodePro and Breakaway 1.0.
 - `GROQ_MODEL`: optional; defaults to `openai/gpt-oss-120b`.
+- `GROQ_REQUEST_TIMEOUT_MS`: optional Groq request timeout; defaults to `90000` and is clamped between 15000 and 180000.
 - `CODEPRO_CLIENT_TOKEN`: optional client access token. When set, POST requests require it as a Bearer token. Desktop installers must not contain provider API keys.
 
-Deploy from `main`. Verify `GET /health` returns `providerReady: true`. It also reports `cloudflareTokenConfigured` and `groqFallbackConfigured` separately without exposing secret values. The legacy `cloudflareConfigured` property remains as a compatibility flag for older desktop clients and means that at least one provider is ready; use `cloudflareTokenConfigured` to check actual Cloudflare configuration.
+Deploy from `main`. Verify `GET /health` returns `providerReady: true`, `codeproProvider: "Groq"`, and `groqConfigured: true` when Groq is set. Health output reports provider readiness only and never exposes secret values. The legacy `cloudflareConfigured` property remains as a compatibility flag for older desktop clients and means that at least one provider is ready; use `cloudflareTokenConfigured` to check actual Cloudflare configuration.
 
 ## API
 
 - `GET /health` — gateway and provider-configuration status; never returns secrets.
-- `POST /api/agent` — Server-Sent Events status and response stream.
-- `POST /api/chat` — JSON response, or SSE when the body includes `"stream": true`.
+- `POST /api/agent` — Groq-first CodePro agent stream, with optional provider fallbacks.
+- `POST /api/chat` — JSON response, or SSE when the body includes `"stream": true`; `model: "isaiah_codepro"` uses the same CodePro agent pipeline.
 
 Example request body:
 
