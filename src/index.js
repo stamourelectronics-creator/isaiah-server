@@ -1223,7 +1223,7 @@ async function handleAgent(req, res, body) {
         selectedProvider: activeProvider.name,
         selectedModel: "isaiah_codepro",
         model: activeProvider.model,
-        fallbackUsed: providers.indexOf(activeProvider) > 0,
+        fallbackUsed: activeProvider.name !== "Groq",
         content,
         tools: [],
         usage: payload?.result?.usage || payload?.usage || null
@@ -1282,7 +1282,7 @@ async function handleAgent(req, res, body) {
         selectedProvider: activeProvider.name,
         selectedModel: "isaiah_codepro",
         model: activeProvider.model,
-        fallbackUsed: providers.indexOf(activeProvider) > 0,
+        fallbackUsed: activeProvider.name !== "Groq",
         content: fullText,
         tools: []
       });
