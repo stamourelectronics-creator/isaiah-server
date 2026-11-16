@@ -767,9 +767,9 @@ async function fetchSearchPage(engine, query, offset, safeSearch) {
   } else if (engine === "bing") {
     url = "https://www.bing.com/search?q=" + encodeURIComponent(query) + "&setlang=en&first=" + (start + 1);
   } else if (engine === "google") {
-    url = "https://www.google.com/search?q=" + encodeURIComponent(query) + "&hl=en&gl=ca&num=20&start=" + start;
+    url = "https://www.google.com/search?q=" + encodeURIComponent(query) + "&hl=en&gl=ca&num=10&start=" + start;
   } else if (engine === "brave") {
-    url = "https://search.brave.com/search?q=" + encodeURIComponent(query) + "&source=web&page=" + (Math.floor(start / 20) + 1);
+    url = "https://search.brave.com/search?q=" + encodeURIComponent(query) + "&source=web&page=" + (Math.floor(start / 10) + 1);
   } else {
     return [];
   }
@@ -856,7 +856,7 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: { maxOutputTokens: detailed ? 4800 : 650, temperature: 0.25 }
         }),
-        signal: AbortSignal.timeout(detailed ? 45000 : 20000)
+        signal: AbortSignal.timeout(detailed ? 60000 : 35000)
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -895,8 +895,10 @@ async function handleQuickSearch(req, res, body, more = false) {
     return sendJson(res, 400, { error: "Choose a supported IsaiahSearch engine." });
   }
   const requestedOffset = Number(body.offset);
+  // The search UI displays small first-page groups. Advance in 10-result pages
+  // so a short scraped first page does not skip the next 20+ links.
   const offset = more
-    ? Math.max(30, Math.min(300, Number.isFinite(requestedOffset) ? Math.floor(requestedOffset / 30) * 30 : 30))
+    ? Math.max(10, Math.min(300, Number.isFinite(requestedOffset) ? Math.floor(requestedOffset / 10) * 10 : 10))
     : 0;
   const results = await searchIsaiahWeb(query, engine, offset, body.safeSearch || "Moderate");
   return sendJson(res, 200, {
@@ -916,6 +918,11 @@ async function handleIsaiahSearchSummary(req, res, body, detailed = false) {
   if (String(body.model || "").toLowerCase() !== "isaiahai_7_super") {
     return sendJson(res, 400, { error: "Search Assist summaries are available through IsaiahAI 7.0 SUPER." });
   }
+  console.info("[ISAIAH_SEARCH_SUMMARY_REQUEST]", JSON.stringify({
+    operation: detailed ? "detailed" : "brief",
+    model: "isaiahai_7_super",
+    sourceCount: Array.isArray(body.results) ? body.results.length : 0
+  }));
   try {
     const summary = await generateIsaiahSuperSummary(query, body.results, {
       detailed,
@@ -955,26 +962,48 @@ async function streamIsaiahSearchSummary(req, res, body) {
     query.slice(0, 2000) + ". Previous overview: " + String(body.previousSummary || "").slice(0, 4500) +
     "\n\nUse these actual IsaiahSearch results as evidence: " + JSON.stringify(sources) +
     "\n\nInclude an executive summary, key findings, source-supported details, limitations, and next questions. Link claims to these source URLs. Never invent facts or citations.";
-  const modelName = ISAIAH_SUPER_SUMMARY_MODEL;
-  let upstream;
-  try {
-    upstream = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":streamGenerateContent?alt=sse", {
-      method: "POST",
-      headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "text/event-stream" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: "You are IsaiahAI 7.0 SUPER. Return only the requested report in Markdown. Never reveal hidden chain-of-thought." }] },
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 4800, temperature: 0.3 }
-      }),
-      signal: AbortSignal.timeout(45000)
-    });
-    if (!upstream.ok) {
-      const payload = await upstream.json().catch(() => ({}));
-      throw Object.assign(new Error(payload?.error?.message || "Summary generation failed."), { status: upstream.status });
+  const modelNames = [...new Set([ISAIAH_SUPER_SUMMARY_MODEL, ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL].filter(Boolean))];
+  let upstream = null;
+  let lastStreamError = null;
+  console.info("[ISAIAH_SEARCH_SUMMARY_REQUEST]", JSON.stringify({
+    operation: "detailed-stream",
+    model: "isaiahai_7_super",
+    sourceCount: sources.length
+  }));
+  for (const modelName of modelNames) {
+    try {
+      const candidate = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":streamGenerateContent?alt=sse", {
+        method: "POST",
+        headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "text/event-stream" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: "You are IsaiahAI 7.0 SUPER. Return only the requested report in Markdown. Never reveal hidden chain-of-thought." }] },
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 4800, temperature: 0.3 }
+        }),
+        signal: AbortSignal.timeout(60000)
+      });
+      if (candidate.ok) {
+        upstream = candidate;
+        break;
+      }
+      const payload = await candidate.json().catch(() => ({}));
+      lastStreamError = Object.assign(new Error(payload?.error?.message || "Summary generation failed."), { status: candidate.status });
+      console.warn("[ISAIAH_SEARCH_SUMMARY_STREAM_ATTEMPT]", JSON.stringify({
+        selectedModel: "isaiahai_7_super",
+        status: candidate.status,
+        fallbackAvailable: modelName !== modelNames[modelNames.length - 1]
+      }));
+    } catch (error) {
+      lastStreamError = error;
+      console.warn("[ISAIAH_SEARCH_SUMMARY_STREAM_ATTEMPT]", JSON.stringify({
+        selectedModel: "isaiahai_7_super",
+        timedOut: error?.name === "TimeoutError" || error?.name === "AbortError",
+        fallbackAvailable: modelName !== modelNames[modelNames.length - 1]
+      }));
     }
-  } catch (error) {
-    console.warn("[ISAIAH_SEARCH_SUMMARY_STREAM]", String(error?.message || error).slice(0, 160));
-    return sendJson(res, error.status || 502, { error: "IsaiahAI 7.0 SUPER could not generate the detailed report. Please retry." });
+  }
+  if (!upstream) {
+    return sendJson(res, lastStreamError?.status || 502, { error: "IsaiahAI 7.0 SUPER could not generate the detailed report. Please retry." });
   }
 
   res.writeHead(200, {
