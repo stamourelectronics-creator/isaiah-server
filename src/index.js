@@ -10,6 +10,8 @@ const GEMINI_CODEPRO_MODEL = process.env.GEMINI_CODEPRO_MODEL || "gemini-3.8-fla
 const GEMINI_53_MODEL = process.env.GEMINI_53_MODEL || "gemini-3.5-flash-lite";
 const GEMINI_60_70_MODEL = process.env.GEMINI_60_70_MODEL || "gemini-3.8-flash";
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash";
+const ISAIAH_SUPER_SUMMARY_MODEL = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
+const ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL = String(process.env.ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL || "gemini-3.5-flash-lite").trim();
 const GEMINI_REQUEST_TIMEOUT_MS = Math.max(10000, Math.min(60000, Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 20000)));
 const GEMINI_SEARCH_GROUNDING_ENABLED = process.env.GEMINI_SEARCH_GROUNDING_ENABLED === "true";
 const DEFAULT_CLOUDFLARE_ACCOUNT_ID = "01fd8f1d70219de577b4d40e01be7b6a";
@@ -374,7 +376,7 @@ function websiteGeminiMessages(body, systemPrompt) {
 
 async function createIsaiahSuperThinkingSummary(body, answer, apiKey) {
   if (body.showThinking !== true || !apiKey) return "";
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || "gemini-2.5-flash").trim();
+  const modelName = ISAIAH_SUPER_SUMMARY_MODEL;
   try {
     const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
       method: "POST",
@@ -795,7 +797,7 @@ async function fetchSearchPage(engine, query, offset, safeSearch) {
   }
 }
 
-function mergeUniqueSearchResults(groups, limit = 20) {
+function mergeUniqueSearchResults(groups, limit = 30) {
   const merged = [];
   const seen = new Set();
   for (const group of groups) {
@@ -814,11 +816,11 @@ async function searchIsaiahWeb(query, engine, offset = 0, safeSearch = "Moderate
   const selected = String(engine || "isaiah").toLowerCase();
   const engines = selected === "isaiah" ? ["duckduckgo", "bing", "brave"] : [selected];
   const groups = await Promise.all(engines.map((name) => fetchSearchPage(name, query, offset, safeSearch)));
-  let results = mergeUniqueSearchResults(groups, 20);
-  if (results.length < 6 && selected !== "google" && selected !== "bing") {
+  let results = mergeUniqueSearchResults(groups, 30);
+  if (results.length < 12 && selected !== "google" && selected !== "bing") {
     const fallbackEngine = selected === "isaiah" ? "google" : "bing";
     const fallback = await fetchSearchPage(fallbackEngine, query, offset, safeSearch);
-    results = mergeUniqueSearchResults([results, fallback], 20);
+    results = mergeUniqueSearchResults([results, fallback], 30);
   }
   return results;
 }
@@ -842,24 +844,35 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
     instruction + "\n\nUser query: " + String(query || "").slice(0, 2000) +
     (previous ? "\n\nPrevious overview:\n" + previous : "") +
     "\n\nActual search results returned by IsaiahSearch:\n" + sourceText;
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || "gemini-2.5-flash").trim();
-  const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
-    method: "POST",
-    headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: "You are IsaiahAI 7.0 SUPER. Return only the requested answer. Be accurate, concise, and honest about uncertainty. Never reveal hidden chain-of-thought." }] },
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: detailed ? 4800 : 650, temperature: 0.25 }
-    }),
-    signal: AbortSignal.timeout(detailed ? 45000 : 24000)
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw Object.assign(new Error(payload?.error?.message || "IsaiahAI 7.0 SUPER could not generate the search summary."), { status: response.status >= 500 ? 502 : response.status });
+  const modelNames = [...new Set([ISAIAH_SUPER_SUMMARY_MODEL, ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL].filter(Boolean))];
+  let lastError = null;
+  for (const modelName of modelNames) {
+    try {
+      const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
+        method: "POST",
+        headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: "You are IsaiahAI 7.0 SUPER. Return only the requested answer. Be accurate, concise, and honest about uncertainty. Never reveal hidden chain-of-thought." }] },
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: detailed ? 4800 : 650, temperature: 0.25 }
+        }),
+        signal: AbortSignal.timeout(detailed ? 45000 : 20000)
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        lastError = Object.assign(new Error(payload?.error?.message || "IsaiahAI 7.0 SUPER could not generate the search summary."), { status: response.status >= 500 ? 502 : response.status });
+        console.warn("[ISAIAH_SEARCH_SUMMARY_ATTEMPT]", JSON.stringify({ model: modelName, status: response.status, fallbackAvailable: modelName !== modelNames[modelNames.length - 1] }));
+        continue;
+      }
+      const summary = extractGeminiContent(payload).trim();
+      if (summary) return summary;
+      lastError = Object.assign(new Error("IsaiahAI 7.0 SUPER returned an empty Search Assist summary."), { status: 502 });
+    } catch (error) {
+      lastError = Object.assign(new Error(String(error?.message || error).slice(0, 240)), { status: 502 });
+      console.warn("[ISAIAH_SEARCH_SUMMARY_ATTEMPT]", JSON.stringify({ model: modelName, timedOut: error?.name === "TimeoutError" || error?.name === "AbortError", fallbackAvailable: modelName !== modelNames[modelNames.length - 1] }));
+    }
   }
-  const summary = extractGeminiContent(payload).trim();
-  if (!summary) throw Object.assign(new Error("IsaiahAI 7.0 SUPER returned an empty Search Assist summary."), { status: 502 });
-  return summary;
+  throw lastError || Object.assign(new Error("IsaiahAI 7.0 SUPER could not complete Search Assist."), { status: 502 });
 }
 
 async function handleQuickSearch(req, res, body, more = false) {
@@ -942,7 +955,7 @@ async function streamIsaiahSearchSummary(req, res, body) {
     query.slice(0, 2000) + ". Previous overview: " + String(body.previousSummary || "").slice(0, 4500) +
     "\n\nUse these actual IsaiahSearch results as evidence: " + JSON.stringify(sources) +
     "\n\nInclude an executive summary, key findings, source-supported details, limitations, and next questions. Link claims to these source URLs. Never invent facts or citations.";
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || "gemini-2.5-flash").trim();
+  const modelName = ISAIAH_SUPER_SUMMARY_MODEL;
   let upstream;
   try {
     upstream = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":streamGenerateContent?alt=sse", {
