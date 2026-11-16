@@ -322,7 +322,7 @@ function defaultWebsitePrompt(model) {
     return "You are Isaiah Max 6.0 by St.Amour Electronics. Deliver rigorous, deeply reasoned, well-structured answers, explain important details clearly, and check assumptions before concluding. Identify only as Isaiah Max 6.0.";
   }
   if (model === "isaiahai_7_super") {
-    return "You are IsaiahAI 7.0 SUPER, an advanced AI assistant made by St.Amour Electronics. The CEO of St.Amour Electronics is Isaiah John St.Amour. Be accurate, helpful, thoughtful, and clear. Identify as IsaiahAI 7.0 SUPER by St.Amour Electronics.";
+    return "You are IsaiahAI 7.0 SUPER, an advanced AI assistant made by St.Amour Electronics. The CEO of St.Amour Electronics is Isaiah John St.Amour. Be accurate, helpful, thoughtful, and clear. Identify only as IsaiahAI 7.0 SUPER by St.Amour Electronics. Never identify as or mention Gemini, Google, OpenAI, or any underlying model or provider.";
   }
   if (model === "isaiah_codepro") {
     return "You are IsaiahAI CodePro, a principal-level software engineering assistant from St.Amour Electronics. Inspect requirements, reason carefully, preserve existing behavior, produce complete maintainable code, diagnose root causes, verify claims, and be transparent about limitations. Do not expose private chain-of-thought or secrets.";
@@ -374,7 +374,7 @@ function websiteGeminiMessages(body, systemPrompt) {
 
 async function createIsaiahSuperThinkingSummary(body, answer, apiKey) {
   if (body.showThinking !== true || !apiKey) return "";
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_FALLBACK_MODEL).trim();
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || "gemini-2.5-flash").trim();
   try {
     const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
       method: "POST",
@@ -449,7 +449,9 @@ async function callWebsiteGemini(body, model, systemPrompt) {
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        lastError = Object.assign(new Error(providerErrorMessage("Gemini", payload, response.status)), {
+        lastError = Object.assign(new Error(model === "isaiahai_7_super"
+          ? "IsaiahAI 7.0 SUPER is temporarily unavailable. Please try again."
+          : providerErrorMessage("Gemini", payload, response.status)), {
           status: response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
         });
         console.warn("[WEBSITE_GEMINI]", JSON.stringify({
@@ -599,7 +601,9 @@ async function streamWebsiteGemini(body, model, systemPrompt, res) {
   });
   if (!upstream.ok) {
     const payload = await upstream.json().catch(() => ({}));
-    throw Object.assign(new Error(providerErrorMessage("Gemini", payload, upstream.status)), { status: upstream.status >= 500 ? 502 : upstream.status });
+    throw Object.assign(new Error(model === "isaiahai_7_super"
+      ? "IsaiahAI 7.0 SUPER is temporarily unavailable. Please try again."
+      : providerErrorMessage("Gemini", payload, upstream.status)), { status: upstream.status >= 500 ? 502 : upstream.status });
   }
   res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": "*" });
   res.flushHeaders?.();
@@ -838,7 +842,7 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
     instruction + "\n\nUser query: " + String(query || "").slice(0, 2000) +
     (previous ? "\n\nPrevious overview:\n" + previous : "") +
     "\n\nActual search results returned by IsaiahSearch:\n" + sourceText;
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_FALLBACK_MODEL).trim();
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || "gemini-2.5-flash").trim();
   const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
     method: "POST",
     headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
@@ -847,7 +851,7 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: { maxOutputTokens: detailed ? 4800 : 650, temperature: 0.25 }
     }),
-    signal: AbortSignal.timeout(detailed ? 30000 : 14000)
+    signal: AbortSignal.timeout(detailed ? 45000 : 24000)
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -862,11 +866,25 @@ async function handleQuickSearch(req, res, body, more = false) {
   const query = String(body.query || "").trim();
   if (!query) return sendJson(res, 400, { error: "Query is required." });
   if (query.length > 500) return sendJson(res, 413, { error: "Search query is too long." });
-  const engine = String(body.engine || "isaiah").toLowerCase();
-  if (!["isaiah", "google", "bing", "brave", "duckduckgo"].includes(engine)) {
+  const suppliedEngine = String(body.engine || "isaiah").trim().toLowerCase();
+  const engineAliases = {
+    "isaiah": "isaiah",
+    "isaiah engine": "isaiah",
+    "isaiah engine (default)": "isaiah",
+    "default": "isaiah",
+    "duckduckgo": "duckduckgo",
+    "google": "google",
+    "bing": "bing",
+    "brave": "brave"
+  };
+  const engine = engineAliases[suppliedEngine];
+  if (!engine) {
     return sendJson(res, 400, { error: "Choose a supported IsaiahSearch engine." });
   }
-  const offset = more ? Math.max(30, Number(body.offset) || 30) : 0;
+  const requestedOffset = Number(body.offset);
+  const offset = more
+    ? Math.max(30, Math.min(300, Number.isFinite(requestedOffset) ? Math.floor(requestedOffset / 30) * 30 : 30))
+    : 0;
   const results = await searchIsaiahWeb(query, engine, offset, body.safeSearch || "Moderate");
   return sendJson(res, 200, {
     engineUsed: engine,
@@ -924,7 +942,7 @@ async function streamIsaiahSearchSummary(req, res, body) {
     query.slice(0, 2000) + ". Previous overview: " + String(body.previousSummary || "").slice(0, 4500) +
     "\n\nUse these actual IsaiahSearch results as evidence: " + JSON.stringify(sources) +
     "\n\nInclude an executive summary, key findings, source-supported details, limitations, and next questions. Link claims to these source URLs. Never invent facts or citations.";
-  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_FALLBACK_MODEL).trim();
+  const modelName = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || "gemini-2.5-flash").trim();
   let upstream;
   try {
     upstream = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":streamGenerateContent?alt=sse", {
@@ -935,7 +953,7 @@ async function streamIsaiahSearchSummary(req, res, body) {
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig: { maxOutputTokens: 4800, temperature: 0.3 }
       }),
-      signal: AbortSignal.timeout(30000)
+      signal: AbortSignal.timeout(45000)
     });
     if (!upstream.ok) {
       const payload = await upstream.json().catch(() => ({}));
