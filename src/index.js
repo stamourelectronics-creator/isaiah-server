@@ -435,11 +435,11 @@ function geminiModelForWebsite(model) {
 function websiteGeminiFallbackModels(model) {
   const candidates = [
     geminiModelForWebsite(model),
-    GEMINI_53_MODEL,
+    // Try modern high-capability fallbacks before the lightweight 5.3 route.
     "gemini-3.7-flash",
     "gemini-3.6-flash",
-    String(process.env.GEMINI_FALLBACK_MODEL || GEMINI_FALLBACK_MODEL).trim(),
-    "gemini-2.5-flash"
+    GEMINI_53_MODEL,
+    String(process.env.GEMINI_FALLBACK_MODEL || GEMINI_FALLBACK_MODEL).trim()
   ];
   return [...new Set(candidates.filter(Boolean))];
 }
