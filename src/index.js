@@ -333,7 +333,7 @@ async function handleBreakaway(req, res, body) {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
         let splitAt;
         while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
           const frame = buffer.slice(0, splitAt);
@@ -672,7 +672,7 @@ async function handleOpenIsaiah(body, res) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
       let splitAt;
       while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
         const frame = buffer.slice(0, splitAt);
@@ -785,7 +785,7 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
     let splitAt;
     while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
       const frame = buffer.slice(0, splitAt);
@@ -802,7 +802,7 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
     }
   }
 
-  buffer += decoder.decode();
+  buffer = (buffer + decoder.decode()).replace(/\r\n/g, "\n");
   if (buffer.trim()) {
     const dataLine = buffer.split("\n").find((line) => line.startsWith("data:"));
     if (dataLine) {
@@ -1324,7 +1324,7 @@ async function streamIsaiahSearchSummary(req, res, body) {
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
     let splitAt;
     while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
       const frame = buffer.slice(0, splitAt);
@@ -1529,7 +1529,7 @@ async function handleAgent(req, res, body) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
       let splitAt;
       while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
         const frame = buffer.slice(0, splitAt);
