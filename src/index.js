@@ -1442,7 +1442,7 @@ async function handleAgent(req, res, body) {
 
   if (!providers.length) {
     return sendJson(res, 503, {
-      error: "No CodePro model provider is configured. Add CLOUDFLARE_API_TOKEN or GROQ_API_KEY as a private Railway variable.",
+      error: "No CodePro model provider is configured. Add GROQ_API_KEY, CLOUDFLARE_API_TOKEN, GEMINI_API_KEY_CODEPRO, or a shared IsaiahAI Gemini key as a private Railway variable.",
       providerReady: false
     });
   }
@@ -1466,7 +1466,7 @@ async function handleAgent(req, res, body) {
   });
   const heartbeatTimer = wantsStream ? setInterval(() => {
     if (res.writableEnded || res.destroyed) return;
-    try { res.write(": keep-alive\\n\\n"); }
+    try { res.write(": keep-alive\n\n"); }
     catch { controller.abort(); }
   }, 15000) : null;
 
