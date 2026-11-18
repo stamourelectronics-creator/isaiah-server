@@ -258,7 +258,19 @@ function providerErrorMessage(provider, payload, status) {
 async function handleBreakaway(req, res, body) {
   const groqKey = String(process.env.GROQ_API_KEY || "").trim();
   if (!groqKey) {
-    return sendJson(res, 503, { error: "Breakaway 1.0 is unavailable because its provider is not configured." });
+    const fallbackModel = getWebsiteGeminiKey("isaiah_max_6_0")
+      ? "isaiah_max_6_0"
+      : getWebsiteGeminiKey("isaiah_5_3") ? "isaiah_5_3" : "";
+    if (!fallbackModel) {
+      return sendJson(res, 503, { error: "Breakaway 1.0 is not configured on this gateway." });
+    }
+    const fallbackBody = { ...body, systemInstruction: BREAKAWAY_SYSTEM_PROMPT };
+    const identity = { brand: "Breakaway 1.0", selectedModel: "breakaway_1_0" };
+    if (body.stream === true) {
+      return streamWebsiteGemini(fallbackBody, fallbackModel, BREAKAWAY_SYSTEM_PROMPT, res, identity);
+    }
+    const result = await callWebsiteGemini(fallbackBody, fallbackModel, BREAKAWAY_SYSTEM_PROMPT, identity);
+    return sendJson(res, 200, result);
   }
 
   const validated = cleanMessages(body);
@@ -420,6 +432,18 @@ function geminiModelForWebsite(model) {
   return GEMINI_CODEPRO_MODEL;
 }
 
+function websiteGeminiFallbackModels(model) {
+  const candidates = [
+    geminiModelForWebsite(model),
+    GEMINI_53_MODEL,
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    String(process.env.GEMINI_FALLBACK_MODEL || GEMINI_FALLBACK_MODEL).trim(),
+    "gemini-2.5-flash"
+  ];
+  return [...new Set(candidates.filter(Boolean))];
+}
+
 function imagePartForGemini(image) {
   const raw = String(image?.data || image?.base64 || "");
   if (!raw) return null;
@@ -481,7 +505,7 @@ async function createIsaiahSuperThinkingSummary(body, answer, apiKey) {
   }
 }
 
-async function callWebsiteGemini(body, model, systemPrompt) {
+async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
   const apiKey = getWebsiteGeminiKey(model);
   if (!apiKey) {
     const variable = model === "isaiah_5_3" || model === "isaiah_max_6_0"
@@ -502,10 +526,7 @@ async function callWebsiteGemini(body, model, systemPrompt) {
 
   const searchRequested = body.searchWebEnabled === true;
   const groundingAllowed = searchRequested && GEMINI_SEARCH_GROUNDING_ENABLED;
-  const primaryModel = geminiModelForWebsite(model);
-  const fallbackModel = String(process.env.GEMINI_FALLBACK_MODEL || GEMINI_FALLBACK_MODEL).trim();
-  const modelNames = [primaryModel];
-  if (fallbackModel && fallbackModel !== primaryModel) modelNames.push(fallbackModel);
+  const modelNames = websiteGeminiFallbackModels(model);
 
   const attempts = [];
   for (const modelName of modelNames) {
@@ -563,10 +584,10 @@ async function callWebsiteGemini(body, model, systemPrompt) {
         ? await createIsaiahSuperThinkingSummary(body, content, apiKey)
         : "";
       return {
-        brand: model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER",
+        brand: identity.brand || (model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER"),
         provider: "IsaiahAI",
         selectedProvider: "IsaiahAI",
-        selectedModel: model,
+        selectedModel: identity.selectedModel || model,
         model: attempt.modelName,
         fallbackUsed: attemptIndex > 0,
         searchUnavailable: searchRequested && (!attempt.useGrounding || sources.length === 0),
@@ -653,10 +674,10 @@ async function handleOpenIsaiah(body, res) {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let splitAt;
-      while ((splitAt = buffer.indexOf("\\n\\n")) !== -1) {
+      while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
         const frame = buffer.slice(0, splitAt);
         buffer = buffer.slice(splitAt + 2);
-        const dataLine = frame.split("\\n").find((line) => line.startsWith("data:"));
+        const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
         if (!dataLine) continue;
         const raw = dataLine.slice(5).trim();
         if (!raw || raw === "[DONE]") continue;
@@ -675,46 +696,141 @@ async function handleOpenIsaiah(body, res) {
   return { brand: "Open-Isaiah", provider: "OpenRouter", selectedProvider: "OpenRouter", selectedModel: "open_isaiah", model: payload?.model || model, content, sources: [], usage: payload?.usage || null };
 }
 
-async function streamWebsiteGemini(body, model, systemPrompt, res) {
+async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}) {
   const apiKey = getWebsiteGeminiKey(model);
   if (!apiKey) throw Object.assign(new Error("The selected model is not configured."), { status: 503 });
-  const providerModel = geminiModelForWebsite(model);
-  const prompt = model === "isaiahai_7_super"
-    ? { ...websiteGeminiMessages(body, systemPrompt), generationConfig: { maxOutputTokens: 8192, temperature: 0.45, thinkingConfig: { thinkingLevel: "LOW" } } }
-    : { ...websiteGeminiMessages(body, systemPrompt), generationConfig: { maxOutputTokens: model === "isaiah_5_3" ? 4096 : 8192, temperature: model === "isaiah_5_3" ? 0.65 : 0.45 } };
-  const upstream = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(providerModel) + ":streamGenerateContent?alt=sse", {
-    method: "POST", headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "text/event-stream" },
-    body: JSON.stringify(prompt), signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS)
-  });
-  if (!upstream.ok) {
-    const payload = await upstream.json().catch(() => ({}));
-    throw Object.assign(new Error(model === "isaiahai_7_super"
-      ? "IsaiahAI 7.0 SUPER is temporarily unavailable. Please try again."
-      : providerErrorMessage("Gemini", payload, upstream.status)), { status: upstream.status >= 500 ? 502 : upstream.status });
+
+  const thinking = normalizeThinking(body);
+  const generationConfig = {
+    maxOutputTokens: model === "isaiah_5_3" ? 4096 : 8192,
+    temperature: model === "isaiah_5_3" ? 0.65 : 0.45
+  };
+  if (thinking.mode === "thinking") {
+    generationConfig.thinkingConfig = {
+      thinkingLevel: model === "isaiahai_7_super" ? "LOW" : thinking.effort.toUpperCase()
+    };
   }
-  res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": "*" });
+
+  const modelNames = websiteGeminiFallbackModels(model);
+  let upstream = null;
+  let providerModel = "";
+  let lastError = null;
+
+  for (let attemptIndex = 0; attemptIndex < modelNames.length; attemptIndex += 1) {
+    const candidateModel = modelNames[attemptIndex];
+    const prompt = { ...websiteGeminiMessages(body, systemPrompt), generationConfig };
+    try {
+      const response = await fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models/" +
+          encodeURIComponent(candidateModel) + ":streamGenerateContent?alt=sse",
+        {
+          method: "POST",
+          headers: {
+            "x-goog-api-key": apiKey,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream"
+          },
+          body: JSON.stringify(prompt),
+          signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS)
+        }
+      );
+
+      if (response.ok && response.body) {
+        upstream = response;
+        providerModel = candidateModel;
+        break;
+      }
+
+      const payload = await response.json().catch(() => ({}));
+      lastError = Object.assign(
+        new Error(providerErrorMessage("Gemini", payload, response.status)),
+        { status: response.status >= 500 ? 502 : response.status }
+      );
+      console.warn("[WEBSITE_GEMINI_STREAM]", JSON.stringify({
+        selectedModel: model,
+        providerModel: candidateModel,
+        status: response.status,
+        fallbackAvailable: attemptIndex < modelNames.length - 1
+      }));
+    } catch (error) {
+      lastError = Object.assign(new Error(String(error?.message || error).slice(0, 300)), { status: 502 });
+      console.warn("[WEBSITE_GEMINI_STREAM]", JSON.stringify({
+        selectedModel: model,
+        providerModel: candidateModel,
+        timedOut: error?.name === "TimeoutError" || error?.name === "AbortError",
+        fallbackAvailable: attemptIndex < modelNames.length - 1
+      }));
+    }
+  }
+
+  if (!upstream) {
+    throw lastError || Object.assign(new Error("Gemini did not return a response."), { status: 502 });
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin": "*"
+  });
   res.flushHeaders?.();
   sendEvent(res, "status", { status: "writing", message: "Writing response…" });
+
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let fullText = "";
+
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     let splitAt;
-    while ((splitAt = buffer.indexOf("\\n\\n")) !== -1) {
+    while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
       const frame = buffer.slice(0, splitAt);
       buffer = buffer.slice(splitAt + 2);
-      const dataLine = frame.split("\\n").find((line) => line.startsWith("data:"));
+      const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
       if (!dataLine) continue;
-      let packet; try { packet = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
+      let packet;
+      try { packet = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
       const delta = extractGeminiContent(packet);
-      if (delta) { fullText += delta; sendEvent(res, "delta", { text: delta }); }
+      if (delta) {
+        fullText += delta;
+        sendEvent(res, "delta", { text: delta });
+      }
     }
   }
-  sendEvent(res, "done", { brand: model === "isaiahai_7_super" ? "IsaiahAI 7.0 SUPER" : "IsaiahAI", provider: "IsaiahAI", model: providerModel, content: fullText });
+
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    const dataLine = buffer.split("\n").find((line) => line.startsWith("data:"));
+    if (dataLine) {
+      try {
+        const packet = JSON.parse(dataLine.slice(5).trim());
+        const delta = extractGeminiContent(packet);
+        if (delta) {
+          fullText += delta;
+          sendEvent(res, "delta", { text: delta });
+        }
+      } catch {}
+    }
+  }
+
+  if (!fullText.trim()) {
+    sendEvent(res, "error", { message: "Gemini finished without returning any text." });
+    res.end();
+    return;
+  }
+
+  sendEvent(res, "done", {
+    brand: identity.brand || (model === "isaiahai_7_super" ? "IsaiahAI 7.0 SUPER" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : model === "open_isaiah" ? "Open-Isaiah" : "IsaiahAI"),
+    provider: "IsaiahAI",
+    selectedModel: identity.selectedModel || model,
+    model: providerModel,
+    content: fullText
+  });
+  res.end();
 }
 
 async function handleWebsiteModel(req, res, body, model) {
@@ -1495,6 +1611,7 @@ const server = http.createServer(async (req, res) => {
     const geminiCodeProConfigured = Boolean(String(process.env.GEMINI_API_KEY_CODEPRO || "").trim());
     const groqConfigured = Boolean(String(process.env.GROQ_API_KEY || "").trim());
     const providerReady = groqConfigured || geminiCodeProConfigured || cloudflareTokenConfigured;
+    const breakawayReady = groqConfigured || Boolean(getWebsiteGeminiKey("isaiah_max_6_0") || getWebsiteGeminiKey("isaiah_5_3"));
     const activeProvider = groqConfigured
       ? { name: "Groq", model: GROQ_MODEL }
       : geminiCodeProConfigured
@@ -1511,15 +1628,16 @@ const server = http.createServer(async (req, res) => {
           ? (process.env.OPEN_ISAIAH_API_KEY || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY)
           : (process.env.OPENROUTER_API_KEY || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY)
       ),
-      isaiah_codepro: providerReady
+      isaiah_codepro: providerReady,
+      breakaway_1_0: breakawayReady
     };
 
     return sendJson(res, 200, {
       ok: true,
       providerReady,
-      breakawayConfigured: groqConfigured,
-      breakawayProvider: groqConfigured ? "Groq" : "not configured",
-      breakawayModel: groqConfigured ? GROQ_MODEL : null,
+      breakawayConfigured: breakawayReady,
+      breakawayProvider: groqConfigured ? "Groq" : breakawayReady ? "Gemini fallback" : "not configured",
+      breakawayModel: groqConfigured ? GROQ_MODEL : breakawayReady ? geminiModelForWebsite("isaiah_max_6_0") : null,
       codeproProvider: activeProvider.name,
       codeproModel: activeProvider.model,
       service: "IsaiahAI CodePro Gateway",
