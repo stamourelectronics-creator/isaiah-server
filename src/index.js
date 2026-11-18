@@ -6,23 +6,23 @@ const HOST = "0.0.0.0";
 const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_MODEL || "@cf/zai-org/glm-4.7-flash";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const rawGroqTimeoutMs = Number(process.env.GROQ_REQUEST_TIMEOUT_MS || 90000);
+const rawGroqTimeoutMs = Number(process.env.GROQ_REQUEST_TIMEOUT_MS || 180000);
 const GROQ_REQUEST_TIMEOUT_MS = Number.isFinite(rawGroqTimeoutMs)
-  ? Math.max(15000, Math.min(180000, rawGroqTimeoutMs))
-  : 90000;
+  ? Math.max(15000, Math.min(300000, rawGroqTimeoutMs))
+  : 180000;
 const GEMINI_CODEPRO_MODEL = process.env.GEMINI_CODEPRO_MODEL || "gemini-3.8-flash";
 const GEMINI_53_MODEL = process.env.GEMINI_53_MODEL || "gemini-3.5-flash-lite";
 const GEMINI_60_70_MODEL = process.env.GEMINI_60_70_MODEL || "gemini-3.8-flash";
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash";
 const ISAIAH_SUPER_SUMMARY_MODEL = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
 const ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL = String(process.env.ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL || "gemini-3.5-flash-lite").trim();
-const GEMINI_REQUEST_TIMEOUT_MS = Math.max(10000, Math.min(60000, Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 20000)));
+const GEMINI_REQUEST_TIMEOUT_MS = Math.max(15000, Math.min(300000, Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 120000)));
 const GEMINI_SEARCH_GROUNDING_ENABLED = process.env.GEMINI_SEARCH_GROUNDING_ENABLED === "true";
 const DEFAULT_CLOUDFLARE_ACCOUNT_ID = "01fd8f1d70219de577b4d40e01be7b6a";
-const MAX_BODY_BYTES = 160_000;
-const MAX_MESSAGES = 30;
-const MAX_MESSAGE_CHARS = 32_000;
-const MAX_OUTPUT_TOKENS = 6000;
+const MAX_BODY_BYTES = 1_000_000;
+const MAX_MESSAGES = 40;
+const MAX_MESSAGE_CHARS = 48_000;
+const MAX_OUTPUT_TOKENS = 8192;
 const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 20;
 const requestsByIp = new Map();
@@ -258,7 +258,7 @@ function providerErrorMessage(provider, payload, status) {
 async function handleBreakaway(req, res, body) {
   const groqKey = String(process.env.GROQ_API_KEY || "").trim();
   if (!groqKey) {
-    return sendJson(res, 503, { error: "Breakaway 1.0 is unavailable because its backup provider is not configured." });
+    return sendJson(res, 503, { error: "Breakaway 1.0 is unavailable because its provider is not configured." });
   }
 
   const validated = cleanMessages(body);
@@ -266,6 +266,19 @@ async function handleBreakaway(req, res, body) {
     { role: "system", content: BREAKAWAY_SYSTEM_PROMPT },
     ...validated.filter((item) => item.role !== "system")
   ]);
+  const wantsStream = body.stream === true;
+
+  if (wantsStream) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+      "Access-Control-Allow-Origin": "*"
+    });
+    res.flushHeaders?.();
+    sendEvent(res, "status", { status: "thinking", message: "Breakaway 1.0 is thinking…" });
+  }
 
   try {
     const upstream = await fetch(GROQ_URL, {
@@ -273,7 +286,7 @@ async function handleBreakaway(req, res, body) {
       headers: {
         "Authorization": "Bearer " + groqKey,
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": wantsStream ? "text/event-stream" : "application/json"
       },
       signal: AbortSignal.timeout(GROQ_REQUEST_TIMEOUT_MS),
       body: JSON.stringify({
@@ -283,32 +296,86 @@ async function handleBreakaway(req, res, body) {
         include_reasoning: false,
         max_completion_tokens: MAX_OUTPUT_TOKENS,
         temperature: 0.65,
-        stream: false
+        stream: wantsStream
       })
     });
 
-    const payload = await upstream.json().catch(() => ({}));
     if (!upstream.ok) {
+      const payload = await upstream.json().catch(() => ({}));
       const detail = payload?.error?.message || payload?.message || ("Groq request failed (" + upstream.status + ").");
-      return sendJson(res, upstream.status >= 500 ? 502 : upstream.status, { error: "Breakaway 1.0 could not complete this request. " + detail });
+      const message = "Breakaway 1.0 could not complete this request. " + detail;
+      if (wantsStream) {
+        sendEvent(res, "error", { message });
+        res.end();
+        return;
+      }
+      return sendJson(res, upstream.status >= 500 ? 502 : upstream.status, { error: message });
     }
 
+    if (wantsStream) {
+      sendEvent(res, "status", { status: "writing", message: "Writing response…" });
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let content = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let splitAt;
+        while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, splitAt);
+          buffer = buffer.slice(splitAt + 2);
+          const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
+          if (!dataLine) continue;
+          const raw = dataLine.slice(5).trim();
+          if (!raw || raw === "[DONE]") continue;
+          let packet;
+          try { packet = JSON.parse(raw); } catch { continue; }
+          const delta = normalizeModelContent(packet?.choices?.[0]?.delta?.content ?? packet?.choices?.[0]?.message?.content);
+          if (delta) {
+            content += delta;
+            sendEvent(res, "delta", { text: delta });
+          }
+        }
+      }
+      if (!content.trim()) sendEvent(res, "error", { message: "Breakaway 1.0's provider returned an empty answer." });
+      else sendEvent(res, "done", {
+        brand: "Breakaway 1.0",
+        provider: "Groq",
+        model: GROQ_MODEL,
+        selectedProvider: "Groq",
+        selectedModel: "breakaway_1_0",
+        content
+      });
+      res.end();
+      return;
+    }
+
+    const payload = await upstream.json().catch(() => ({}));
     const content = extractCloudflareContent(payload).trim();
     if (!content) return sendJson(res, 502, { error: "Breakaway 1.0's provider returned an empty answer." });
 
     return sendJson(res, 200, {
       brand: "Breakaway 1.0",
-      provider: "Groq fallback",
+      provider: "Groq",
       model: GROQ_MODEL,
       selectedProvider: "Groq",
+      selectedModel: "breakaway_1_0",
       content,
       tools: [],
       usage: payload?.usage || null
     });
   } catch (error) {
-    return sendJson(res, 502, {
-      error: error?.name === "AbortError" ? "Breakaway 1.0 timed out. Please retry." : (error?.message || "Breakaway 1.0 could not reach its provider.")
-    });
+    const message = error?.name === "AbortError" ? "Breakaway 1.0 timed out. Please retry." : (error?.message || "Breakaway 1.0 could not reach its provider.");
+    if (wantsStream) {
+      if (!res.writableEnded) {
+        sendEvent(res, "error", { message });
+        res.end();
+      }
+    } else {
+      return sendJson(res, 502, { error: message });
+    }
   }
 }
 
@@ -536,15 +603,19 @@ function extractOpenIsaiahKeys(payload) {
 }
 
 async function handleOpenIsaiah(body, res) {
-  const provider = String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase();
-  if (provider === "gemini") {
+  const requestedProvider = String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase();
+  const apiKey = String(process.env.OPENROUTER_API_KEY || "").trim();
+  const geminiFallbackAvailable = Boolean(getWebsiteGeminiKey("open_isaiah"));
+  // Keep OpenRouter preferred when its key exists; otherwise use the existing
+  // Gemini credentials instead of leaving Open-Isaiah unavailable.
+  const useGemini = requestedProvider === "gemini" || (!apiKey && geminiFallbackAvailable);
+  if (useGemini) {
     const systemPrompt = String(body.systemInstruction || defaultWebsitePrompt("open_isaiah"));
     if (body.stream === true) return await streamWebsiteGemini(body, "open_isaiah", systemPrompt, res);
     return await callWebsiteGemini(body, "open_isaiah", systemPrompt);
   }
-  const apiKey = String(process.env.OPENROUTER_API_KEY || "").trim();
   if (!apiKey) {
-    throw Object.assign(new Error("Open-Isaiah needs OPENROUTER_API_KEY configured as a private Railway variable. Create an OpenRouter API key and add it to the codepro-gateway service; the key is never placed in the website or app."), { status: 503 });
+    throw Object.assign(new Error("Open-Isaiah is not configured. Add an OpenRouter key or a Gemini model key to the private Railway gateway."), { status: 503 });
   }
   const endpoint = String(process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1/chat/completions").trim();
   const model = String(process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-5.5").trim();
@@ -923,7 +994,7 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: { maxOutputTokens: detailed ? 4800 : 650, temperature: 0.25 }
         }),
-        signal: AbortSignal.timeout(detailed ? 60000 : 35000)
+        signal: AbortSignal.timeout(detailed ? 180000 : 90000)
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -1048,7 +1119,7 @@ async function streamIsaiahSearchSummary(req, res, body) {
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: { maxOutputTokens: 4800, temperature: 0.3 }
         }),
-        signal: AbortSignal.timeout(60000)
+        signal: AbortSignal.timeout(180000)
       });
       if (candidate.ok) {
         upstream = candidate;
@@ -1285,6 +1356,7 @@ async function handleAgent(req, res, body) {
       return;
     }
 
+    sendEvent(res, "status", { status: "writing", message: "Writing response…" });
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -1386,9 +1458,11 @@ const server = http.createServer(async (req, res) => {
       isaiah_5_3: Boolean(process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY),
       isaiah_max_6_0: Boolean(process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY),
       isaiahai_7_super: Boolean(process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY),
-      open_isaiah: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini"
-        ? Boolean(process.env.OPEN_ISAIAH_API_KEY || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY)
-        : Boolean(process.env.OPENROUTER_API_KEY),
+      open_isaiah: Boolean(
+        String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini"
+          ? (process.env.OPEN_ISAIAH_API_KEY || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY)
+          : (process.env.OPENROUTER_API_KEY || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY)
+      ),
       isaiah_codepro: providerReady
     };
 
@@ -1406,7 +1480,9 @@ const server = http.createServer(async (req, res) => {
       models: websiteModels,
       geminiCodeProConfigured,
       geminiSearchGroundingEnabled: GEMINI_SEARCH_GROUNDING_ENABLED,
-      openIsaiahProvider: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini" ? "Gemini API" : "OpenRouter",
+      openIsaiahProvider: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini"
+        ? "Gemini API"
+        : (process.env.OPENROUTER_API_KEY ? "OpenRouter" : (getWebsiteGeminiKey("open_isaiah") ? "Gemini API fallback" : "not configured")),
       openIsaiahModel: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini"
         ? String(process.env.OPEN_ISAIAH_GEMINI_MODEL || GEMINI_60_70_MODEL)
         : (process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-5.5"),
