@@ -433,9 +433,14 @@ function geminiModelForWebsite(model) {
 }
 
 function websiteGeminiFallbackModels(model) {
+  // 7.0 SUPER uses one fast, known fallback instead of walking through several
+  // unavailable model names. This prevents minutes of stacked provider waits.
+  if (model === "isaiahai_7_super") {
+    return [...new Set([geminiModelForWebsite(model), GEMINI_53_MODEL].filter(Boolean))];
+  }
+
   const candidates = [
     geminiModelForWebsite(model),
-    // Try modern high-capability fallbacks before the lightweight 5.3 route.
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     GEMINI_53_MODEL,
@@ -516,12 +521,15 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
 
   const thinking = normalizeThinking(body);
   const generationConfig = {
-    maxOutputTokens: model === "isaiah_5_3" ? 4096 : 8192,
+    maxOutputTokens: model === "isaiah_5_3" ? 4096 : model === "isaiahai_7_super" ? 4096 : 8192,
     temperature: model === "isaiah_5_3" ? 0.65 : 0.45
   };
-  if (thinking.mode === "thinking") {
-    // 7.0 SUPER uses a lighter reasoning pass for noticeably faster everyday replies.
-    generationConfig.thinkingConfig = { thinkingLevel: model === "isaiahai_7_super" ? "LOW" : thinking.effort.toUpperCase() };
+  if (model === "isaiahai_7_super") {
+    generationConfig.thinkingConfig = {
+      thinkingLevel: thinking.mode === "thinking" ? thinking.effort.toUpperCase() : "LOW"
+    };
+  } else if (thinking.mode === "thinking") {
+    generationConfig.thinkingConfig = { thinkingLevel: thinking.effort.toUpperCase() };
   }
 
   const searchRequested = body.searchWebEnabled === true;
@@ -549,7 +557,7 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
         method: "POST",
         headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS)
+        signal: AbortSignal.timeout(model === "isaiahai_7_super" ? 28000 : GEMINI_REQUEST_TIMEOUT_MS)
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -700,73 +708,29 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
   const apiKey = getWebsiteGeminiKey(model);
   if (!apiKey) throw Object.assign(new Error("The selected model is not configured."), { status: 503 });
 
+  const isSuper = model === "isaiahai_7_super";
   const thinking = normalizeThinking(body);
   const generationConfig = {
-    maxOutputTokens: model === "isaiah_5_3" ? 4096 : 8192,
+    maxOutputTokens: model === "isaiah_5_3" ? 4096 : isSuper ? 4096 : 8192,
     temperature: model === "isaiah_5_3" ? 0.65 : 0.45
   };
-  if (thinking.mode === "thinking") {
+  if (isSuper) {
     generationConfig.thinkingConfig = {
-      thinkingLevel: model === "isaiahai_7_super" ? "LOW" : thinking.effort.toUpperCase()
+      thinkingLevel: thinking.mode === "thinking" ? thinking.effort.toUpperCase() : "LOW"
     };
+  } else if (thinking.mode === "thinking") {
+    generationConfig.thinkingConfig = { thinkingLevel: thinking.effort.toUpperCase() };
   }
 
   const modelNames = websiteGeminiFallbackModels(model);
-  let upstream = null;
-  let providerModel = "";
+  const handshakeTimeoutMs = isSuper ? 18000 : GEMINI_REQUEST_TIMEOUT_MS;
+  const firstTokenBudgetMs = isSuper ? 28000 : GEMINI_REQUEST_TIMEOUT_MS;
+  const streamIdleTimeoutMs = isSuper ? 45000 : GEMINI_REQUEST_TIMEOUT_MS;
   let lastError = null;
+  let writingAnnounced = false;
 
-  for (let attemptIndex = 0; attemptIndex < modelNames.length; attemptIndex += 1) {
-    const candidateModel = modelNames[attemptIndex];
-    const prompt = { ...websiteGeminiMessages(body, systemPrompt), generationConfig };
-    try {
-      const response = await fetch(
-        "https://generativelanguage.googleapis.com/v1beta/models/" +
-          encodeURIComponent(candidateModel) + ":streamGenerateContent?alt=sse",
-        {
-          method: "POST",
-          headers: {
-            "x-goog-api-key": apiKey,
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream"
-          },
-          body: JSON.stringify(prompt),
-          signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS)
-        }
-      );
-
-      if (response.ok && response.body) {
-        upstream = response;
-        providerModel = candidateModel;
-        break;
-      }
-
-      const payload = await response.json().catch(() => ({}));
-      lastError = Object.assign(
-        new Error(providerErrorMessage("Gemini", payload, response.status)),
-        { status: response.status >= 500 ? 502 : response.status }
-      );
-      console.warn("[WEBSITE_GEMINI_STREAM]", JSON.stringify({
-        selectedModel: model,
-        providerModel: candidateModel,
-        status: response.status,
-        fallbackAvailable: attemptIndex < modelNames.length - 1
-      }));
-    } catch (error) {
-      lastError = Object.assign(new Error(String(error?.message || error).slice(0, 300)), { status: 502 });
-      console.warn("[WEBSITE_GEMINI_STREAM]", JSON.stringify({
-        selectedModel: model,
-        providerModel: candidateModel,
-        timedOut: error?.name === "TimeoutError" || error?.name === "AbortError",
-        fallbackAvailable: attemptIndex < modelNames.length - 1
-      }));
-    }
-  }
-
-  if (!upstream) {
-    throw lastError || Object.assign(new Error("Gemini did not return a response."), { status: 502 });
-  }
-
+  // Open SSE immediately so the chat never waits silently while fallback
+  // provider models are being tried.
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -775,62 +739,211 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
     "Access-Control-Allow-Origin": "*"
   });
   res.flushHeaders?.();
-  sendEvent(res, "status", { status: "writing", message: "Writing response…" });
+  sendEvent(res, "status", {
+    status: "thinking",
+    message: isSuper ? "IsaiahAI 7.0 SUPER is thinking…" : "Thinking…"
+  });
 
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let fullText = "";
+  const keepAlive = setInterval(() => {
+    if (!res.destroyed && !res.writableEnded) {
+      try { res.write(": keep-alive\n\n"); } catch {}
+    }
+  }, 10000);
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
-    let splitAt;
-    while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
-      const frame = buffer.slice(0, splitAt);
-      buffer = buffer.slice(splitAt + 2);
-      const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
-      if (!dataLine) continue;
-      let packet;
-      try { packet = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
-      const delta = extractGeminiContent(packet);
-      if (delta) {
-        fullText += delta;
-        sendEvent(res, "delta", { text: delta });
+  try {
+    for (let attemptIndex = 0; attemptIndex < modelNames.length; attemptIndex += 1) {
+      const candidateModel = modelNames[attemptIndex];
+      const attemptStartedAt = Date.now();
+      const firstTokenDeadline = attemptStartedAt + firstTokenBudgetMs;
+      const controller = new AbortController();
+      let reader = null;
+      let candidateText = "";
+      let buffer = "";
+
+      if (attemptIndex > 0) {
+        sendEvent(res, "status", {
+          status: "thinking",
+          message: "Switching to a faster response route…"
+        });
+      }
+
+      try {
+        const prompt = { ...websiteGeminiMessages(body, systemPrompt), generationConfig };
+        const handshakeTimer = setTimeout(() => controller.abort(), handshakeTimeoutMs);
+        let response;
+        try {
+          response = await fetch(
+            "https://generativelanguage.googleapis.com/v1beta/models/" +
+              encodeURIComponent(candidateModel) + ":streamGenerateContent?alt=sse",
+            {
+              method: "POST",
+              headers: {
+                "x-goog-api-key": apiKey,
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream"
+              },
+              body: JSON.stringify(prompt),
+              signal: controller.signal
+            }
+          );
+        } finally {
+          clearTimeout(handshakeTimer);
+        }
+
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          const detail = providerErrorMessage("Gemini", payload, response.status);
+          lastError = new Error(detail);
+          const retryable = response.status === 429 || response.status >= 500 || response.status === 400;
+          console.warn("[WEBSITE_GEMINI_STREAM]", JSON.stringify({
+            selectedModel: model,
+            providerModel: candidateModel,
+            status: response.status,
+            fallbackAvailable: attemptIndex < modelNames.length - 1
+          }));
+          if (!retryable) break;
+          continue;
+        }
+
+        if (!response.body) {
+          lastError = new Error("The model provider returned no response stream.");
+          continue;
+        }
+
+        reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        const processFrames = (chunk, final = false) => {
+          buffer = (buffer + chunk).replace(/\r\n/g, "\n");
+          let splitAt;
+          while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
+            const frame = buffer.slice(0, splitAt);
+            buffer = buffer.slice(splitAt + 2);
+            const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
+            if (!dataLine) continue;
+            const raw = dataLine.slice(5).trim();
+            if (!raw || raw === "[DONE]") continue;
+            let packet;
+            try { packet = JSON.parse(raw); } catch { continue; }
+            const delta = extractGeminiContent(packet);
+            if (delta) {
+              if (!writingAnnounced) {
+                sendEvent(res, "status", { status: "writing", message: "Writing response…" });
+                writingAnnounced = true;
+              }
+              candidateText += delta;
+              sendEvent(res, "delta", { text: delta });
+            }
+          }
+
+          if (final && buffer.trim()) {
+            const dataLine = buffer.split("\n").find((line) => line.startsWith("data:"));
+            if (dataLine) {
+              try {
+                const packet = JSON.parse(dataLine.slice(5).trim());
+                const delta = extractGeminiContent(packet);
+                if (delta) {
+                  if (!writingAnnounced) {
+                    sendEvent(res, "status", { status: "writing", message: "Writing response…" });
+                    writingAnnounced = true;
+                  }
+                  candidateText += delta;
+                  sendEvent(res, "delta", { text: delta });
+                }
+              } catch {}
+            }
+            buffer = "";
+          }
+        };
+
+        while (true) {
+          const remainingMs = candidateText
+            ? streamIdleTimeoutMs
+            : Math.max(0, firstTokenDeadline - Date.now());
+          if (remainingMs <= 0) {
+            throw new Error("The model took too long to start its answer.");
+          }
+
+          let timeoutId;
+          let next;
+          try {
+            next = await Promise.race([
+              reader.read(),
+              new Promise((_, reject) => {
+                timeoutId = setTimeout(
+                  () => reject(new Error(candidateText
+                    ? "The model stream stopped sending data."
+                    : "The model did not start answering in time.")),
+                  remainingMs
+                );
+              })
+            ]);
+          } finally {
+            clearTimeout(timeoutId);
+          }
+
+          if (next.done) {
+            processFrames(decoder.decode(), true);
+            break;
+          }
+          processFrames(decoder.decode(next.value, { stream: true }));
+        }
+
+        if (candidateText.trim()) {
+          sendEvent(res, "done", {
+            brand: identity.brand || (isSuper ? "IsaiahAI 7.0 SUPER" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : model === "open_isaiah" ? "Open-Isaiah" : "IsaiahAI"),
+            provider: "IsaiahAI",
+            selectedModel: identity.selectedModel || model,
+            model: candidateModel,
+            fallbackUsed: attemptIndex > 0,
+            content: candidateText
+          });
+          res.end();
+          return;
+        }
+
+        lastError = new Error("The model provider finished without returning any text.");
+      } catch (error) {
+        lastError = new Error(String(error?.message || error).slice(0, 300));
+        console.warn("[WEBSITE_GEMINI_STREAM]", JSON.stringify({
+          selectedModel: model,
+          providerModel: candidateModel,
+          timedOut: /timed out|time to start|stopped sending|abort/i.test(lastError.message),
+          fallbackAvailable: attemptIndex < modelNames.length - 1
+        }));
+      } finally {
+        try { controller.abort(); } catch {}
+        if (reader) {
+          try { await reader.cancel(); } catch {}
+        }
+      }
+
+      // Do not splice a second model's words into an answer already shown.
+      if (candidateText.trim()) {
+        sendEvent(res, "error", {
+          message: "IsaiahAI 7.0 SUPER's response stream was interrupted. Please retry your message."
+        });
+        res.end();
+        return;
       }
     }
-  }
 
-  buffer = (buffer + decoder.decode()).replace(/\r\n/g, "\n");
-  if (buffer.trim()) {
-    const dataLine = buffer.split("\n").find((line) => line.startsWith("data:"));
-    if (dataLine) {
-      try {
-        const packet = JSON.parse(dataLine.slice(5).trim());
-        const delta = extractGeminiContent(packet);
-        if (delta) {
-          fullText += delta;
-          sendEvent(res, "delta", { text: delta });
-        }
-      } catch {}
-    }
-  }
-
-  if (!fullText.trim()) {
-    sendEvent(res, "error", { message: "Gemini finished without returning any text." });
+    sendEvent(res, "error", {
+      message: isSuper
+        ? "IsaiahAI 7.0 SUPER could not get a response from its fast model routes. Please retry in a moment."
+        : (lastError?.message || "The selected model could not complete this response.")
+    });
     res.end();
-    return;
+  } catch (error) {
+    if (!res.writableEnded && !res.destroyed) {
+      sendEvent(res, "error", {
+        message: String(error?.message || "The model stream failed.").slice(0, 300)
+      });
+      res.end();
+    }
+  } finally {
+    clearInterval(keepAlive);
   }
-
-  sendEvent(res, "done", {
-    brand: identity.brand || (model === "isaiahai_7_super" ? "IsaiahAI 7.0 SUPER" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : model === "open_isaiah" ? "Open-Isaiah" : "IsaiahAI"),
-    provider: "IsaiahAI",
-    selectedModel: identity.selectedModel || model,
-    model: providerModel,
-    content: fullText
-  });
-  res.end();
 }
 
 async function handleWebsiteModel(req, res, body, model) {
