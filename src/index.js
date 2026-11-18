@@ -1353,6 +1353,22 @@ async function streamIsaiahSearchSummary(req, res, body) {
   res.end();
 }
 
+function getCodeProGeminiCredentials() {
+  const candidates = [
+    { source: "CodePro", key: process.env.GEMINI_API_KEY_CODEPRO },
+    { source: "IsaiahAI 7.0", key: process.env.GEMINI_API_KEY_70 },
+    { source: "IsaiahAI 5.3/6.0", key: process.env.GEMINI_API_KEY_53_60 },
+    { source: "Shared Gemini", key: process.env.GEMINI_API_KEY }
+  ];
+  const seen = new Set();
+  return candidates.filter((item) => {
+    const key = String(item.key || "").trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map((item) => ({ source: item.source, key: String(item.key).trim() }));
+}
+
 async function handleAgent(req, res, body) {
   const token = String(process.env.CLOUDFLARE_API_TOKEN || "").trim();
   const accountId = String(process.env.CLOUDFLARE_ACCOUNT_ID || DEFAULT_CLOUDFLARE_ACCOUNT_ID).trim();
@@ -1360,21 +1376,26 @@ async function handleAgent(req, res, body) {
   const cloudflareConfigured = Boolean(token && /^[a-f0-9]{32}$/i.test(accountId));
   const providers = [];
 
-  const geminiCodeProKey = String(process.env.GEMINI_API_KEY_CODEPRO || "").trim();
-  if (geminiCodeProKey) {
-    const geminiModels = [...new Set([GEMINI_CODEPRO_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean))];
-    for (const modelName of geminiModels) {
+  const codeProGeminiCredentials = getCodeProGeminiCredentials();
+  codeProGeminiCredentials.forEach((credential, keyIndex) => {
+    // Prefer CodePro's dedicated key/models. If it is throttled or unavailable,
+    // try the already-configured IsaiahAI shared keys on the proven 5.3 route.
+    const geminiModels = keyIndex === 0
+      ? [GEMINI_CODEPRO_MODEL, GEMINI_FALLBACK_MODEL, GEMINI_53_MODEL]
+      : [GEMINI_53_MODEL, GEMINI_FALLBACK_MODEL];
+    for (const modelName of [...new Set(geminiModels.filter(Boolean))]) {
       providers.push({
         name: "Gemini",
+        keySource: credential.source,
         model: modelName,
         format: "gemini",
         timeoutMs: GEMINI_REQUEST_TIMEOUT_MS,
         endpoint: (stream) => "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + (stream ? ":streamGenerateContent?alt=sse" : ":generateContent"),
-        headers: { "x-goog-api-key": geminiCodeProKey },
+        headers: { "x-goog-api-key": credential.key },
         makeBody: (messages) => makeGeminiAgentBody(messages, false, "high")
       });
     }
-  }
+  });
 
   if (cloudflareConfigured) {
     providers.push({
@@ -1443,6 +1464,11 @@ async function handleAgent(req, res, body) {
   res.on("close", () => {
     if (!res.writableEnded) controller.abort();
   });
+  const heartbeatTimer = wantsStream ? setInterval(() => {
+    if (res.writableEnded || res.destroyed) return;
+    try { res.write(": keep-alive\\n\\n"); }
+    catch { controller.abort(); }
+  }, 15000) : null;
 
   try {
     let upstream = null;
@@ -1476,6 +1502,8 @@ async function handleAgent(req, res, body) {
         lastProviderError = providerErrorMessage(provider.name, payload, response.status);
         console.warn("[CODEPRO_PROVIDER]", JSON.stringify({
           provider: provider.name,
+          keySource: provider.keySource || "not applicable",
+          model: provider.model,
           status: response.status,
           fallbackAvailable: providers.indexOf(provider) < providers.length - 1
         }));
@@ -1587,6 +1615,8 @@ async function handleAgent(req, res, body) {
     } else {
       sendJson(res, 502, { error: error.message || "The CodePro server could not complete the AI request." });
     }
+  } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
   }
 }
 
@@ -1609,12 +1639,13 @@ const server = http.createServer(async (req, res) => {
       /^[a-f0-9]{32}$/i.test(String(process.env.CLOUDFLARE_ACCOUNT_ID || DEFAULT_CLOUDFLARE_ACCOUNT_ID))
     );
     const geminiCodeProConfigured = Boolean(String(process.env.GEMINI_API_KEY_CODEPRO || "").trim());
+    const codeproGeminiCredentials = getCodeProGeminiCredentials();
     const groqConfigured = Boolean(String(process.env.GROQ_API_KEY || "").trim());
-    const providerReady = groqConfigured || geminiCodeProConfigured || cloudflareTokenConfigured;
+    const providerReady = groqConfigured || codeproGeminiCredentials.length > 0 || cloudflareTokenConfigured;
     const breakawayReady = groqConfigured || Boolean(getWebsiteGeminiKey("isaiah_max_6_0") || getWebsiteGeminiKey("isaiah_5_3"));
     const activeProvider = groqConfigured
       ? { name: "Groq", model: GROQ_MODEL }
-      : geminiCodeProConfigured
+      : codeproGeminiCredentials.length > 0
         ? { name: "Gemini fallback", model: GEMINI_CODEPRO_MODEL }
         : cloudflareTokenConfigured
           ? { name: "Cloudflare Workers AI fallback", model: CLOUDFLARE_MODEL }
@@ -1645,6 +1676,8 @@ const server = http.createServer(async (req, res) => {
       model: activeProvider.model,
       models: websiteModels,
       geminiCodeProConfigured,
+      codeproGeminiFallbackConfigured: codeproGeminiCredentials.length > (geminiCodeProConfigured ? 1 : 0),
+      codeproGeminiCredentialCount: codeproGeminiCredentials.length,
       geminiSearchGroundingEnabled: GEMINI_SEARCH_GROUNDING_ENABLED,
       openIsaiahProvider: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini"
         ? "Gemini API"
