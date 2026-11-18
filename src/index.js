@@ -811,6 +811,43 @@ async function fetchSearchPage(engine, query, offset, safeSearch) {
   }
 }
 
+async function fetchWikipediaSearchPage(query, offset = 0) {
+  try {
+    const params = new URLSearchParams({
+      action: "query",
+      list: "search",
+      srsearch: query,
+      srlimit: "20",
+      sroffset: String(Math.max(0, Number(offset) || 0)),
+      format: "json",
+      utf8: "1",
+      origin: "*"
+    });
+    const response = await fetch("https://en.wikipedia.org/w/api.php?" + params.toString(), {
+      headers: { "User-Agent": "IsaiahSearch/2.0 (web search)" },
+      signal: AbortSignal.timeout(9000)
+    });
+    if (!response.ok) return [];
+    const payload = await response.json().catch(() => ({}));
+    return (payload?.query?.search || []).map((item) => {
+      const title = stripSearchMarkup(item?.title || "");
+      const snippet = stripSearchMarkup(item?.snippet || "");
+      return {
+        title,
+        url: "https://en.wikipedia.org/wiki/" + encodeURIComponent(title.replace(/ /g, "_")),
+        snippet,
+        siteName: "Wikipedia"
+      };
+    }).filter((item) => item.title && item.url);
+  } catch (error) {
+    console.warn("[ISAIAHSEARCH_WIKIPEDIA]", JSON.stringify({
+      failed: true,
+      reason: String(error?.message || error).slice(0, 140)
+    }));
+    return [];
+  }
+}
+
 function mergeUniqueSearchResults(groups, limit = 30) {
   const merged = [];
   const seen = new Set();
@@ -828,14 +865,30 @@ function mergeUniqueSearchResults(groups, limit = 30) {
 
 async function searchIsaiahWeb(query, engine, offset = 0, safeSearch = "Moderate") {
   const selected = String(engine || "isaiah").toLowerCase();
-  const engines = selected === "isaiah" ? ["duckduckgo", "bing", "brave"] : [selected];
-  const groups = await Promise.all(engines.map((name) => fetchSearchPage(name, query, offset, safeSearch)));
-  let results = mergeUniqueSearchResults(groups, 30);
-  if (results.length < 12 && selected !== "google" && selected !== "bing") {
-    const fallbackEngine = selected === "isaiah" ? "google" : "bing";
-    const fallback = await fetchSearchPage(fallbackEngine, query, offset, safeSearch);
-    results = mergeUniqueSearchResults([results, fallback], 30);
+  const allEngines = ["duckduckgo", "bing", "brave", "google"];
+  const primaryEngines = selected === "isaiah" ? allEngines : [selected];
+  const primaryGroups = await Promise.all(
+    primaryEngines.map((name) => fetchSearchPage(name, query, offset, safeSearch))
+  );
+  let results = mergeUniqueSearchResults(primaryGroups, 30);
+
+  // Keep the chosen engine first, but supplement sparse pages with other live
+  // indexes rather than leaving the user with only a few links.
+  if (results.length < 20) {
+    const fallbackEngines = allEngines.filter((name) => !primaryEngines.includes(name));
+    const fallbackGroups = await Promise.all(
+      fallbackEngines.map((name) => fetchSearchPage(name, query, offset, safeSearch))
+    );
+    results = mergeUniqueSearchResults([results, ...fallbackGroups], 30);
   }
+
+  // Wikimedia provides a resilient fallback when commercial indexes block or
+  // throttle requests. These are direct article URLs, not search portal links.
+  if (results.length < 20) {
+    const wikipedia = await fetchWikipediaSearchPage(query, offset);
+    results = mergeUniqueSearchResults([results, wikipedia], 30);
+  }
+
   return results;
 }
 
@@ -918,11 +971,12 @@ async function handleQuickSearch(req, res, body, more = false) {
   return sendJson(res, 200, {
     engineUsed: engine,
     results,
+    resultCount: results.length,
     images: [],
     videos: [],
     news: [],
     offset,
-    hasMore: results.length > 0
+    hasMore: results.length >= 10
   });
 }
 
