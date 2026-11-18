@@ -762,11 +762,20 @@ function normalizeExternalSearchUrl(rawHref, engine) {
   if (!href) return "";
   try {
     const parsed = new URL(href.startsWith("//") ? "https:" + href : href, "https://www." + engine + ".com");
-    const redirected = parsed.searchParams.get("uddg") || parsed.searchParams.get("url") || parsed.searchParams.get("q");
-    if (redirected && (parsed.hostname.includes("duckduckgo.com") || parsed.hostname.includes("google.") || parsed.hostname.includes("bing.com"))) {
+    const host = parsed.hostname.toLowerCase();
+    const redirected = parsed.searchParams.get("uddg") || parsed.searchParams.get("url") ||
+      (parsed.pathname === "/url" ? parsed.searchParams.get("q") : "");
+    if (redirected && (host.includes("duckduckgo.com") || host.includes("google.") || host.includes("bing.com"))) {
       href = redirected;
-    } else if (parsed.hostname.includes("google.") && parsed.pathname === "/url") {
-      href = parsed.searchParams.get("q") || parsed.searchParams.get("url") || href;
+    } else if (host.includes("bing.com")) {
+      // Bing wraps many destinations in /ck/a?u=a1<base64url>; decode the real URL.
+      const encoded = parsed.searchParams.get("u") || "";
+      if (encoded.startsWith("a1") && encoded.length > 4) {
+        const base64 = encoded.slice(2).replace(/-/g, "+").replace(/_/g, "/");
+        const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
+        const decoded = Buffer.from(padded, "base64").toString("utf8").trim();
+        if (/^https?:\/\//i.test(decoded)) href = decoded;
+      }
     }
   } catch {}
   try {
@@ -919,6 +928,38 @@ async function fetchWikipediaSearchPage(query, offset = 0) {
   }
 }
 
+async function fetchBingRssSearchPage(query, offset = 0) {
+  try {
+    const first = Math.max(1, Math.floor(Number(offset) || 0) + 1);
+    const url = "https://www.bing.com/search?format=rss&count=30&first=" + first + "&q=" + encodeURIComponent(query);
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; IsaiahSearch/2.0)",
+        "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.7"
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!response.ok) return [];
+    const xml = await response.text();
+    const items = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)];
+    return items.map((match) => {
+      const item = match[1] || "";
+      const read = (tag) => {
+        const raw = item.match(new RegExp("<" + tag + "(?:\\s[^>]*)?>([\\s\\S]*?)<\\/" + tag + ">", "i"))?.[1] || "";
+        return decodeSearchEntities(raw.replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "").trim());
+      };
+      return makeSearchResult(read("link"), read("title"), read("description"), "bing");
+    }).filter(Boolean);
+  } catch (error) {
+    console.warn("[ISAIAHSEARCH_RSS]", JSON.stringify({
+      engine: "bing",
+      failed: true,
+      reason: String(error?.message || error).slice(0, 140)
+    }));
+    return [];
+  }
+}
+
 function mergeUniqueSearchResults(groups, limit = 30) {
   const merged = [];
   const seen = new Set();
@@ -943,8 +984,15 @@ async function searchIsaiahWeb(query, engine, offset = 0, safeSearch = "Moderate
   );
   let results = mergeUniqueSearchResults(primaryGroups, 30);
 
-  // Keep the chosen engine first, but supplement sparse pages with other live
-  // indexes rather than leaving the user with only a few links.
+  // Bing's RSS endpoint provides a second result extraction route when its
+  // HTML markup changes or crawler-facing HTML is blocked.
+  if (results.length < 20) {
+    const rssResults = await fetchBingRssSearchPage(query, offset);
+    results = mergeUniqueSearchResults([results, rssResults], 30);
+  }
+
+  // Keep the chosen engine first, then supplement sparse pages with other
+  // available live indexes instead of returning only a couple of links.
   if (results.length < 20) {
     const fallbackEngines = allEngines.filter((name) => !primaryEngines.includes(name));
     const fallbackGroups = await Promise.all(
@@ -953,8 +1001,8 @@ async function searchIsaiahWeb(query, engine, offset = 0, safeSearch = "Moderate
     results = mergeUniqueSearchResults([results, ...fallbackGroups], 30);
   }
 
-  // Wikimedia provides a resilient fallback when commercial indexes block or
-  // throttle requests. These are direct article URLs, not search portal links.
+  // Wikimedia is the resilient, clearly-labelled real-article fallback when
+  // commercial indexes block or throttle their search pages.
   if (results.length < 20) {
     const wikipedia = await fetchWikipediaSearchPage(query, offset);
     results = mergeUniqueSearchResults([results, wikipedia], 30);
@@ -1047,7 +1095,7 @@ async function handleQuickSearch(req, res, body, more = false) {
     videos: [],
     news: [],
     offset,
-    hasMore: results.length >= 10
+    hasMore: results.length > 0 && offset < 300
   });
 }
 
