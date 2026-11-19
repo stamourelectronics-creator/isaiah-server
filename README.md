@@ -22,7 +22,7 @@ Configure these private Railway variables:
 - `GEMINI_53_MODEL`, `GEMINI_60_70_MODEL`, `GEMINI_CODEPRO_MODEL`: optional model identifiers; defaults are listed above.
 - `GEMINI_FALLBACK_MODEL`: optional shared fallback model; defaults to `gemini-3.5-flash`.
 - `ISAIAH_SUPER_SUMMARY_MODEL`: optional separate fast Flash model for IsaiahAI 7.0 SUPER Search Assist overviews and reasoning summaries; defaults to `GEMINI_FALLBACK_MODEL`.
-- `GEMINI_REQUEST_TIMEOUT_MS`: optional per-model attempt timeout in milliseconds; defaults to `20000` and is clamped between 10000 and 60000.
+- `GEMINI_REQUEST_TIMEOUT_MS`: optional per-model attempt timeout in milliseconds; defaults to `20000` and is clamped between 8000 and 45000. Open-Isaiah and IsaiahAI 7.0 SUPER use at most two Gemini model attempts; CodePro uses a maximum of two Gemini key/model attempts before returning an error.
 - `GEMINI_SEARCH_GROUNDING_ENABLED`: defaults to `false` so chats work with standard free-tier keys. Set to `true` only when the Gemini account tier has Google Search grounding access. When disabled, the API returns a normal model answer with `searchUnavailable: true`; the website tells users the answer has no live web verification.
 - `OPEN_ISAIAH_PROVIDER`: set to `gemini` to run Open-Isaiah through the existing private Gemini model-key slots; set to `openrouter` to use the OpenRouter path.
 - `OPEN_ISAIAH_API_KEY`: optional dedicated private key for Open-Isaiah. When omitted in Gemini mode, the gateway reuses `GEMINI_API_KEY_70`, then `GEMINI_API_KEY_53_60`, then `GEMINI_API_KEY`.
@@ -33,7 +33,7 @@ Configure these private Railway variables:
 - `CLOUDFLARE_MODEL`: optional; defaults to `@cf/zai-org/glm-4.7-flash`.
 - `GROQ_API_KEY`: private Groq API key; primary provider for IsaiahAI CodePro and Breakaway 1.0.
 - `GROQ_MODEL`: optional; defaults to `openai/gpt-oss-120b`.
-- `GROQ_REQUEST_TIMEOUT_MS`: optional Groq request timeout; defaults to `90000` and is clamped between 15000 and 180000.
+- `GROQ_REQUEST_TIMEOUT_MS`: optional Groq request timeout; defaults to `60000` and is clamped between 15000 and 120000.
 - `CODEPRO_CLIENT_TOKEN`: optional client access token. When set, POST requests require it as a Bearer token. Desktop installers must not contain provider API keys.
 
 Deploy from `main`. Verify `GET /health` returns `providerReady: true`, `codeproProvider: "Groq"`, and `groqConfigured: true` when Groq is set. Health output reports provider readiness only and never exposes secret values. The legacy `cloudflareConfigured` property remains as a compatibility flag for older desktop clients and means that at least one provider is ready; use `cloudflareTokenConfigured` to check actual Cloudflare configuration.
