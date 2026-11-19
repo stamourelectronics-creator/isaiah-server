@@ -6,17 +6,20 @@ const HOST = "0.0.0.0";
 const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_MODEL || "@cf/zai-org/glm-4.7-flash";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const rawGroqTimeoutMs = Number(process.env.GROQ_REQUEST_TIMEOUT_MS || 90000);
+const rawGroqTimeoutMs = Number(process.env.GROQ_REQUEST_TIMEOUT_MS || 60000);
 const GROQ_REQUEST_TIMEOUT_MS = Number.isFinite(rawGroqTimeoutMs)
-  ? Math.max(15000, Math.min(180000, rawGroqTimeoutMs))
-  : 90000;
+  ? Math.max(15000, Math.min(120000, rawGroqTimeoutMs))
+  : 60000;
 const GEMINI_CODEPRO_MODEL = process.env.GEMINI_CODEPRO_MODEL || "gemini-3.8-flash";
 const GEMINI_53_MODEL = process.env.GEMINI_53_MODEL || "gemini-3.5-flash-lite";
 const GEMINI_60_70_MODEL = process.env.GEMINI_60_70_MODEL || "gemini-3.8-flash";
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash";
 const ISAIAH_SUPER_SUMMARY_MODEL = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
 const ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL = String(process.env.ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL || "gemini-3.5-flash-lite").trim();
-const GEMINI_REQUEST_TIMEOUT_MS = Math.max(15000, Math.min(300000, Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 120000)));
+const rawGeminiTimeoutMs = Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 20000);
+const GEMINI_REQUEST_TIMEOUT_MS = Number.isFinite(rawGeminiTimeoutMs)
+  ? Math.max(8000, Math.min(45000, rawGeminiTimeoutMs))
+  : 20000;
 const GEMINI_SEARCH_GROUNDING_ENABLED = process.env.GEMINI_SEARCH_GROUNDING_ENABLED === "true";
 const DEFAULT_CLOUDFLARE_ACCOUNT_ID = "01fd8f1d70219de577b4d40e01be7b6a";
 const MAX_BODY_BYTES = 1_000_000;
@@ -265,9 +268,9 @@ function providerErrorMessage(provider, payload, status) {
 async function handleBreakaway(req, res, body) {
   const groqKey = String(process.env.GROQ_API_KEY || "").trim();
   if (!groqKey) {
-    const fallbackModel = getWebsiteGeminiKey("isaiah_max_6_0")
-      ? "isaiah_max_6_0"
-      : getWebsiteGeminiKey("isaiah_5_3") ? "isaiah_5_3" : "";
+    const fallbackModel = getWebsiteGeminiKey("isaiah_5_3")
+      ? "isaiah_5_3"
+      : getWebsiteGeminiKey("isaiah_max_6_0") ? "isaiah_max_6_0" : "";
     if (!fallbackModel) {
       return sendJson(res, 503, { error: "Breakaway 1.0 is not configured on this gateway." });
     }
@@ -440,9 +443,9 @@ function geminiModelForWebsite(model) {
 }
 
 function websiteGeminiFallbackModels(model) {
-  // 7.0 SUPER uses one fast, known fallback instead of walking through several
-  // unavailable model names. This prevents minutes of stacked provider waits.
-  if (model === "isaiahai_7_super") {
+  // These models use a short primary + fast IsaiahAI 5.3 fallback chain.
+  // Avoid walking through multiple unavailable model IDs and stacking timeouts.
+  if (model === "isaiahai_7_super" || model === "open_isaiah") {
     return [...new Set([geminiModelForWebsite(model), GEMINI_53_MODEL].filter(Boolean))];
   }
 
@@ -1500,25 +1503,29 @@ async function handleAgent(req, res, body) {
   const maxCompletionTokens = reasoningEffort === "high" ? MAX_OUTPUT_TOKENS : 4096;
 
   const codeProGeminiCredentials = getCodeProGeminiCredentials();
-  codeProGeminiCredentials.forEach((credential, keyIndex) => {
-    // Prefer CodePro's dedicated key/models. If it is throttled or unavailable,
-    // try the already-configured IsaiahAI shared keys on the proven 5.3 route.
-    const geminiModels = keyIndex === 0
-      ? [GEMINI_CODEPRO_MODEL, GEMINI_53_MODEL]
-      : [GEMINI_53_MODEL];
-    for (const modelName of [...new Set(geminiModels.filter(Boolean))]) {
+  if (codeProGeminiCredentials.length) {
+    const primaryCredential = codeProGeminiCredentials[0];
+    const fallbackCredential = codeProGeminiCredentials.find((item) => item.key !== primaryCredential.key) || primaryCredential;
+    const attempts = [
+      { credential: primaryCredential, model: GEMINI_CODEPRO_MODEL },
+      { credential: fallbackCredential, model: GEMINI_53_MODEL }
+    ].filter((item, index, all) =>
+      item.model && all.findIndex((candidate) => candidate.credential.key === item.credential.key && candidate.model === item.model) === index
+    );
+
+    for (const attempt of attempts) {
       providers.push({
         name: "Gemini",
-        keySource: credential.source,
-        model: modelName,
+        keySource: attempt.credential.source,
+        model: attempt.model,
         format: "gemini",
-        timeoutMs: Math.min(GEMINI_REQUEST_TIMEOUT_MS, 45000),
-        endpoint: (stream) => "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + (stream ? ":streamGenerateContent?alt=sse" : ":generateContent"),
-        headers: { "x-goog-api-key": credential.key },
+        timeoutMs: GEMINI_REQUEST_TIMEOUT_MS,
+        endpoint: (stream) => "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(attempt.model) + (stream ? ":streamGenerateContent?alt=sse" : ":generateContent"),
+        headers: { "x-goog-api-key": attempt.credential.key },
         makeBody: (messages) => makeGeminiAgentBody(messages, false, reasoningEffort)
       });
     }
-  });
+  }
 
   if (cloudflareConfigured) {
     providers.push({
