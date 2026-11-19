@@ -1,6 +1,6 @@
 {
   "name": "isaiahai-codepro-gateway",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Private server gateway for IsaiahAI CodePro powered by Groq GPT-OSS-120B",
   "type": "module",
