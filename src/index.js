@@ -6,20 +6,30 @@ const HOST = "0.0.0.0";
 const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_MODEL || "@cf/zai-org/glm-4.7-flash";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const rawGroqTimeoutMs = Number(process.env.GROQ_REQUEST_TIMEOUT_MS || 60000);
+// Keep slow first-token responses from being cut off before the model can return
+// the tool instructions needed by the desktop agent. All limits remain bounded.
+const rawGroqTimeoutMs = Number(process.env.GROQ_REQUEST_TIMEOUT_MS || 120000);
 const GROQ_REQUEST_TIMEOUT_MS = Number.isFinite(rawGroqTimeoutMs)
-  ? Math.max(15000, Math.min(120000, rawGroqTimeoutMs))
-  : 60000;
+  ? Math.max(30000, Math.min(240000, rawGroqTimeoutMs))
+  : 120000;
 const GEMINI_CODEPRO_MODEL = process.env.GEMINI_CODEPRO_MODEL || "gemini-3.8-flash";
 const GEMINI_53_MODEL = process.env.GEMINI_53_MODEL || "gemini-3.5-flash-lite";
 const GEMINI_60_70_MODEL = process.env.GEMINI_60_70_MODEL || "gemini-3.8-flash";
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash";
 const ISAIAH_SUPER_SUMMARY_MODEL = String(process.env.ISAIAH_SUPER_SUMMARY_MODEL || GEMINI_60_70_MODEL).trim();
 const ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL = String(process.env.ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL || "gemini-3.5-flash-lite").trim();
-const rawGeminiTimeoutMs = Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 20000);
+const rawGeminiTimeoutMs = Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 90000);
 const GEMINI_REQUEST_TIMEOUT_MS = Number.isFinite(rawGeminiTimeoutMs)
-  ? Math.max(8000, Math.min(45000, rawGeminiTimeoutMs))
-  : 20000;
+  ? Math.max(15000, Math.min(180000, rawGeminiTimeoutMs))
+  : 90000;
+const rawGeminiFirstTokenTimeoutMs = Number(process.env.GEMINI_FIRST_TOKEN_TIMEOUT_MS || 120000);
+const GEMINI_FIRST_TOKEN_TIMEOUT_MS = Number.isFinite(rawGeminiFirstTokenTimeoutMs)
+  ? Math.max(30000, Math.min(240000, rawGeminiFirstTokenTimeoutMs))
+  : 120000;
+const rawGeminiStreamIdleTimeoutMs = Number(process.env.GEMINI_STREAM_IDLE_TIMEOUT_MS || 120000);
+const GEMINI_STREAM_IDLE_TIMEOUT_MS = Number.isFinite(rawGeminiStreamIdleTimeoutMs)
+  ? Math.max(15000, Math.min(240000, rawGeminiStreamIdleTimeoutMs))
+  : 120000;
 const GEMINI_SEARCH_GROUNDING_ENABLED = process.env.GEMINI_SEARCH_GROUNDING_ENABLED === "true";
 const DEFAULT_CLOUDFLARE_ACCOUNT_ID = "01fd8f1d70219de577b4d40e01be7b6a";
 const MAX_BODY_BYTES = 1_000_000;
@@ -583,7 +593,7 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
         method: "POST",
         headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(model === "isaiahai_7_super" ? 28000 : GEMINI_REQUEST_TIMEOUT_MS)
+        signal: AbortSignal.timeout(model === "isaiahai_7_super" ? 120000 : GEMINI_REQUEST_TIMEOUT_MS)
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -688,7 +698,7 @@ async function handleOpenIsaiah(body, res) {
     method: "POST",
     headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json", "Accept": wantsStream ? "text/event-stream" : "application/json", "HTTP-Referer": "https://stamourelectronics-creator.github.io/", "X-Title": "IsaiahSearch - Open-Isaiah" },
     body: JSON.stringify({ model, messages, stream: wantsStream, temperature: 0.5, max_tokens: 4096 }),
-    signal: AbortSignal.timeout(90000)
+    signal: AbortSignal.timeout(180000)
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
@@ -749,9 +759,16 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
   }
 
   const modelNames = websiteGeminiFallbackModels(model);
-  const handshakeTimeoutMs = isSuper ? 18000 : GEMINI_REQUEST_TIMEOUT_MS;
-  const firstTokenBudgetMs = isSuper ? 28000 : GEMINI_REQUEST_TIMEOUT_MS;
-  const streamIdleTimeoutMs = isSuper ? 45000 : GEMINI_REQUEST_TIMEOUT_MS;
+  // Desktop agent turns may need a longer planning period before the first
+  // fenced command appears. Keep a generous first-token budget and tolerate
+  // ordinary pauses between streamed tokens without aborting the whole turn.
+  const handshakeTimeoutMs = Math.max(45000, Math.min(90000, GEMINI_REQUEST_TIMEOUT_MS));
+  const firstTokenBudgetMs = isSuper
+    ? Math.max(150000, GEMINI_FIRST_TOKEN_TIMEOUT_MS)
+    : GEMINI_FIRST_TOKEN_TIMEOUT_MS;
+  const streamIdleTimeoutMs = isSuper
+    ? Math.max(120000, GEMINI_STREAM_IDLE_TIMEOUT_MS)
+    : GEMINI_STREAM_IDLE_TIMEOUT_MS;
   let lastError = null;
   let writingAnnounced = false;
 
