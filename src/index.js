@@ -1962,6 +1962,12 @@ const server = http.createServer(async (req, res) => {
         await handleAgent(req, res, body);
         return;
       }
+      // The website posts selectable models to /api/chat. Keep Breakaway on
+      // its dedicated provider and system-prompt handler, not the CodePro route.
+      if (model === "breakaway_1_0") {
+        await handleBreakaway(req, res, body);
+        return;
+      }
       if (["isaiah_5_3", "isaiah_max_6_0", "isaiahai_7_super", "open_isaiah"].includes(model)) {
         await handleWebsiteModel(req, res, body, model);
         return;
