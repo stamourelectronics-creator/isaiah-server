@@ -292,7 +292,7 @@ async function handleBreakaway(req, res, body) {
   const breakawaySystemPrompt = body.desktopAgent === true
     ? BREAKAWAY_SYSTEM_PROMPT + "\n\n" + DESKTOP_AGENT_SYSTEM_PROMPT
     : BREAKAWAY_SYSTEM_PROMPT;
-  if (Array.isArray(body.images) && body.images.length > 0) {
+  if (hasImageContext(body)) {
     const visionModel = getWebsiteGeminiKey("isaiah_5_3") ? "isaiah_5_3"
       : getWebsiteGeminiKey("isaiahai_7_super") ? "isaiahai_7_super" : "";
     if (!visionModel) {
@@ -536,6 +536,29 @@ function normalizeRequestImages(body) {
   return images;
 }
 
+function normalizeImageContext(body) {
+  body.images = normalizeRequestImages(body);
+  let remaining = Math.max(0, 4 - body.images.length);
+  if (Array.isArray(body.history)) {
+    for (let index = body.history.length - 1; index >= 0; index -= 1) {
+      const item = body.history[index];
+      if (!item || !Array.isArray(item.images)) continue;
+      if (remaining <= 0) {
+        item.images = [];
+        continue;
+      }
+      item.images = item.images.slice(0, remaining).map(normalizeImageInput).filter(Boolean);
+      remaining -= item.images.length;
+    }
+  }
+  return body.images;
+}
+
+function hasImageContext(body) {
+  return (Array.isArray(body?.images) && body.images.length > 0) ||
+    (Array.isArray(body?.history) && body.history.some((item) => Array.isArray(item?.images) && item.images.length > 0));
+}
+
 function imagePartForGemini(image) {
   const normalized = normalizeImageInput(image);
   if (!normalized) return null;
@@ -741,7 +764,7 @@ async function handleOpenIsaiah(body, res) {
   const geminiFallbackAvailable = Boolean(getWebsiteGeminiKey("open_isaiah"));
   // Keep OpenRouter preferred when its key exists; otherwise use the existing
   // Gemini credentials instead of leaving Open-Isaiah unavailable.
-  const imageAttached = Array.isArray(body.images) && body.images.length > 0;
+  const imageAttached = hasImageContext(body);
   const useGemini = requestedProvider === "gemini" || (!apiKey && geminiFallbackAvailable) || (imageAttached && geminiFallbackAvailable);
   if (useGemini) {
     const systemPrompt = String(body.systemInstruction || defaultWebsitePrompt("open_isaiah"));
@@ -2019,7 +2042,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const body = await readJson(req);
-    body.images = normalizeRequestImages(body);
+    normalizeImageContext(body);
     if (url.pathname === "/api/search-wide") {
       await handleWebsiteWideSearch(req, res, body);
       return;
