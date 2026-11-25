@@ -530,25 +530,34 @@ function normalizeRequestImages(body) {
   }
   const images = input.map(normalizeImageInput).filter(Boolean);
   const totalBytes = images.reduce((total, image) => total + image.size, 0);
-  if (totalBytes > 10 * 1024 * 1024) {
-    throw Object.assign(new Error("The combined image attachments must be 10 MB or smaller."), { status: 413 });
+  if (totalBytes > 8 * 1024 * 1024) {
+    throw Object.assign(new Error("The combined current image attachments must be 8 MB or smaller."), { status: 413 });
   }
   return images;
 }
 
 function normalizeImageContext(body) {
   body.images = normalizeRequestImages(body);
-  let remaining = Math.max(0, 4 - body.images.length);
+  let remainingImages = Math.max(0, 4 - body.images.length);
+  let remainingBytes = 8 * 1024 * 1024 - body.images.reduce((total, image) => total + image.size, 0);
   if (Array.isArray(body.history)) {
     for (let index = body.history.length - 1; index >= 0; index -= 1) {
       const item = body.history[index];
       if (!item || !Array.isArray(item.images)) continue;
-      if (remaining <= 0) {
+      if (remainingImages <= 0 || remainingBytes <= 0) {
         item.images = [];
         continue;
       }
-      item.images = item.images.slice(0, remaining).map(normalizeImageInput).filter(Boolean);
-      remaining -= item.images.length;
+      const kept = [];
+      for (const rawImage of item.images) {
+        if (kept.length >= remainingImages || remainingBytes <= 0) break;
+        const image = normalizeImageInput(rawImage);
+        if (!image || image.size > remainingBytes) continue;
+        kept.push(image);
+        remainingImages -= 1;
+        remainingBytes -= image.size;
+      }
+      item.images = kept;
     }
   }
   return body.images;
