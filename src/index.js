@@ -499,14 +499,14 @@ function websiteGeminiFallbackModels(model) {
 function normalizeImageInput(image) {
   const raw = typeof image === "string" ? image : String(image?.data || image?.base64 || "");
   if (!raw.trim()) return null;
-  const match = raw.match(/^data:([^;,]+);base64,([\\s\\S]+)$/i);
+  const match = raw.match(/^data:([^;,]+);base64,([\s\S]+)$/i);
   const mimeType = String((typeof image === "object" && image?.mimeType) || match?.[1] || "image/png")
     .split(";")[0].trim().toLowerCase();
   const supportedTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif", "image/heic", "image/heif"]);
   if (!supportedTypes.has(mimeType)) {
     throw Object.assign(new Error("Unsupported image type: " + mimeType + ". Attach a PNG, JPEG, WebP, GIF, HEIC, or HEIF image."), { status: 415 });
   }
-  const data = (match ? match[2] : raw).replace(/\\s/g, "");
+  const data = (match ? match[2] : raw).replace(/\s/g, "");
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(data) || data.length % 4 === 1) {
     throw Object.assign(new Error("An attached image is not valid base64 data. Please reattach the image."), { status: 400 });
   }
