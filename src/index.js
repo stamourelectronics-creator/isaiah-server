@@ -32,7 +32,7 @@ const GEMINI_STREAM_IDLE_TIMEOUT_MS = Number.isFinite(rawGeminiStreamIdleTimeout
   : 120000;
 const GEMINI_SEARCH_GROUNDING_ENABLED = process.env.GEMINI_SEARCH_GROUNDING_ENABLED === "true";
 const DEFAULT_CLOUDFLARE_ACCOUNT_ID = "01fd8f1d70219de577b4d40e01be7b6a";
-const MAX_BODY_BYTES = 1_000_000;
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const MAX_MESSAGES = 40;
 const MAX_MESSAGE_CHARS = 48_000;
 const MAX_OUTPUT_TOKENS = 8192;
@@ -292,6 +292,17 @@ async function handleBreakaway(req, res, body) {
   const breakawaySystemPrompt = body.desktopAgent === true
     ? BREAKAWAY_SYSTEM_PROMPT + "\n\n" + DESKTOP_AGENT_SYSTEM_PROMPT
     : BREAKAWAY_SYSTEM_PROMPT;
+  if (Array.isArray(body.images) && body.images.length > 0) {
+    const visionModel = getWebsiteGeminiKey("isaiah_5_3") ? "isaiah_5_3"
+      : getWebsiteGeminiKey("isaiahai_7_super") ? "isaiahai_7_super" : "";
+    if (!visionModel) {
+      return sendJson(res, 503, { error: "Breakaway 1.0 can inspect images when an IsaiahAI Gemini vision route is configured. No vision provider is available right now." });
+    }
+    const identity = { brand: "Breakaway 1.0", selectedModel: "breakaway_1_0" };
+    if (body.stream === true) return streamWebsiteGemini(body, visionModel, breakawaySystemPrompt, res, identity);
+    const result = await callWebsiteGemini(body, visionModel, breakawaySystemPrompt, identity);
+    return sendJson(res, 200, result);
+  }
   const groqKey = String(process.env.GROQ_API_KEY || "").trim();
   if (!groqKey) {
     const fallbackModel = getWebsiteGeminiKey("isaiah_5_3")
@@ -440,7 +451,7 @@ function getWebsiteGeminiKey(model) {
     return String(process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY || "").trim();
   }
   if (model === "isaiah_codepro") {
-    return String(process.env.GEMINI_API_KEY_CODEPRO || process.env.GEMINI_API_KEY || "").trim();
+    return String(process.env.GEMINI_API_KEY_CODEPRO || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY || "").trim();
   }
   return "";
 }
@@ -485,21 +496,78 @@ function websiteGeminiFallbackModels(model) {
   return [...new Set(candidates.filter(Boolean))];
 }
 
+function normalizeImageInput(image) {
+  const raw = typeof image === "string" ? image : String(image?.data || image?.base64 || "");
+  if (!raw.trim()) return null;
+  const match = raw.match(/^data:([^;,]+);base64,([\\s\\S]+)$/i);
+  const mimeType = String((typeof image === "object" && image?.mimeType) || match?.[1] || "image/png")
+    .split(";")[0].trim().toLowerCase();
+  const supportedTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif", "image/heic", "image/heif"]);
+  if (!supportedTypes.has(mimeType)) {
+    throw Object.assign(new Error("Unsupported image type: " + mimeType + ". Attach a PNG, JPEG, WebP, GIF, HEIC, or HEIF image."), { status: 415 });
+  }
+  const data = (match ? match[2] : raw).replace(/\\s/g, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(data) || data.length % 4 === 1) {
+    throw Object.assign(new Error("An attached image is not valid base64 data. Please reattach the image."), { status: 400 });
+  }
+  const bytes = Buffer.from(data, "base64");
+  if (!bytes.length) throw Object.assign(new Error("An attached image is empty or unreadable."), { status: 400 });
+  if (bytes.length > 4 * 1024 * 1024) {
+    throw Object.assign(new Error("Each attached image must be 4 MB or smaller after compression."), { status: 413 });
+  }
+  return {
+    name: String((typeof image === "object" && image?.name) || "attached-image").slice(0, 180),
+    mimeType,
+    data: bytes.toString("base64"),
+    size: bytes.length
+  };
+}
+
+function normalizeRequestImages(body) {
+  const input = Array.isArray(body?.images) ? body.images : [];
+  if (input.length > 4) {
+    throw Object.assign(new Error("Attach up to four images per message."), { status: 413 });
+  }
+  const images = input.map(normalizeImageInput).filter(Boolean);
+  const totalBytes = images.reduce((total, image) => total + image.size, 0);
+  if (totalBytes > 10 * 1024 * 1024) {
+    throw Object.assign(new Error("The combined image attachments must be 10 MB or smaller."), { status: 413 });
+  }
+  return images;
+}
+
 function imagePartForGemini(image) {
-  const raw = String(image?.data || image?.base64 || "");
-  if (!raw) return null;
-  const match = raw.match(/^data:([^;,]+);base64,(.+)$/s);
-  const data = match ? match[2] : raw;
-  const mimeType = String(image?.mimeType || match?.[1] || "image/png").split(";")[0];
-  if (!/^[A-Za-z0-9+/=\r\n]+$/.test(data)) return null;
-  return { inlineData: { mimeType, data: data.replace(/\s/g, "") } };
+  const normalized = normalizeImageInput(image);
+  if (!normalized) return null;
+  return { inlineData: { mimeType: normalized.mimeType, data: normalized.data } };
+}
+
+function imageContentForOpenAI(text, images) {
+  const validImages = (Array.isArray(images) ? images : []).map(normalizeImageInput).filter(Boolean);
+  if (!validImages.length) return String(text || "");
+  return [
+    { type: "text", text: String(text || "") },
+    ...validImages.map((image) => ({
+      type: "image_url",
+      image_url: { url: "data:" + image.mimeType + ";base64," + image.data }
+    }))
+  ];
 }
 
 function websiteGeminiMessages(body, systemPrompt) {
   const history = Array.isArray(body.history) ? body.history : [];
   const items = history.slice(-24).filter((item) =>
     item && ["user", "assistant"].includes(item.role) && typeof item.content === "string"
-  ).map((item) => ({ role: item.role === "assistant" ? "model" : "user", parts: [{ text: item.content }] }));
+  ).map((item) => {
+    const parts = [{ text: item.content }];
+    if (item.role === "user" && Array.isArray(item.images)) {
+      for (const image of item.images.slice(0, 4)) {
+        const part = imagePartForGemini(image);
+        if (part) parts.push(part);
+      }
+    }
+    return { role: item.role === "assistant" ? "model" : "user", parts };
+  });
   const message = String(body.message || "").trim();
   const last = items[items.length - 1];
   if (message && !(last?.role === "user" && last.parts?.[0]?.text === message)) {
@@ -673,7 +741,8 @@ async function handleOpenIsaiah(body, res) {
   const geminiFallbackAvailable = Boolean(getWebsiteGeminiKey("open_isaiah"));
   // Keep OpenRouter preferred when its key exists; otherwise use the existing
   // Gemini credentials instead of leaving Open-Isaiah unavailable.
-  const useGemini = requestedProvider === "gemini" || (!apiKey && geminiFallbackAvailable);
+  const imageAttached = Array.isArray(body.images) && body.images.length > 0;
+  const useGemini = requestedProvider === "gemini" || (!apiKey && geminiFallbackAvailable) || (imageAttached && geminiFallbackAvailable);
   if (useGemini) {
     const systemPrompt = String(body.systemInstruction || defaultWebsitePrompt("open_isaiah"));
     if (body.stream === true) return await streamWebsiteGemini(body, "open_isaiah", systemPrompt, res);
@@ -687,10 +756,18 @@ async function handleOpenIsaiah(body, res) {
   const system = String(body.systemInstruction || defaultWebsitePrompt("open_isaiah"));
   const messages = [
     { role: "system", content: system },
-    ...(Array.isArray(body.history) ? body.history.slice(-24).filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").map((item) => ({ role: item.role, content: item.content })) : [])
+    ...(Array.isArray(body.history) ? body.history.slice(-24).filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").map((item) => ({
+      role: item.role,
+      content: item.role === "user" ? imageContentForOpenAI(item.content, item.images) : item.content
+    })) : [])
   ];
   const message = String(body.message || "").trim();
-  if (message && !(messages[messages.length - 1]?.role === "user" && messages[messages.length - 1]?.content === message)) messages.push({ role: "user", content: message });
+  const lastMessage = messages[messages.length - 1];
+  if (message && !(lastMessage?.role === "user" && typeof lastMessage.content === "string" && lastMessage.content === message)) {
+    messages.push({ role: "user", content: imageContentForOpenAI(message, body.images) });
+  } else if (message && Array.isArray(body.images) && body.images.length && lastMessage?.role === "user") {
+    lastMessage.content = imageContentForOpenAI(message, body.images);
+  }
   if (messages.length < 2) throw Object.assign(new Error("Type a message to start chatting."), { status: 400 });
 
   const wantsStream = body.stream === true;
@@ -1569,6 +1646,20 @@ function getCodeProGeminiCredentials() {
 }
 
 async function handleAgent(req, res, body) {
+  if (Array.isArray(body.images) && body.images.length > 0) {
+    const visionKeyAvailable = Boolean(getWebsiteGeminiKey("isaiah_codepro"));
+    if (!visionKeyAvailable) {
+      return sendJson(res, 503, { error: "IsaiahAI CodePro needs a configured Gemini vision route to inspect attached images. The text-only CodePro providers were not sent an image they cannot read." });
+    }
+    const systemPrompt = (typeof body.systemInstruction === "string" && body.systemInstruction.trim()
+      ? body.systemInstruction
+      : defaultWebsitePrompt("isaiah_codepro")) + (body.desktopAgent === true ? "\n\n" + DESKTOP_AGENT_SYSTEM_PROMPT : "");
+    const identity = { brand: "IsaiahAI CodePro", selectedModel: "isaiah_codepro" };
+    if (body.stream === true || String(req.url || "").startsWith("/api/agent")) {
+      return streamWebsiteGemini(body, "isaiah_codepro", systemPrompt, res, identity);
+    }
+    return sendJson(res, 200, await callWebsiteGemini(body, "isaiah_codepro", systemPrompt, identity));
+  }
   const token = String(process.env.CLOUDFLARE_API_TOKEN || "").trim();
   const accountId = String(process.env.CLOUDFLARE_ACCOUNT_ID || DEFAULT_CLOUDFLARE_ACCOUNT_ID).trim();
   const groqKey = String(process.env.GROQ_API_KEY || "").trim();
@@ -1928,6 +2019,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const body = await readJson(req);
+    body.images = normalizeRequestImages(body);
     if (url.pathname === "/api/search-wide") {
       await handleWebsiteWideSearch(req, res, body);
       return;
