@@ -442,7 +442,9 @@ let openIsaiahKeyCursor = 0;
 
 function getWebsiteGeminiKey(model) {
   if (model === "open_isaiah") {
-    return String(process.env.OPEN_ISAIAH_API_KEY || process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY || "").trim();
+    const explicitlyGemini = String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini";
+    return String((explicitlyGemini ? process.env.OPEN_ISAIAH_API_KEY : "") ||
+      process.env.GEMINI_API_KEY_70 || process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY || "").trim();
   }
   if (model === "isaiah_5_3" || model === "isaiah_max_6_0") {
     return String(process.env.GEMINI_API_KEY_53_60 || process.env.GEMINI_API_KEY || "").trim();
@@ -514,7 +516,7 @@ function websiteGeminiApiKeys(model) {
     ];
   } else {
     candidates = [
-      { source: "Open-Isaiah", key: process.env.OPEN_ISAIAH_API_KEY },
+      { source: "Open-Isaiah Gemini", key: String(process.env.OPEN_ISAIAH_PROVIDER || "openrouter").trim().toLowerCase() === "gemini" ? process.env.OPEN_ISAIAH_API_KEY : "" },
       { source: "IsaiahAI 7.0 fallback", key: process.env.GEMINI_API_KEY_70 },
       { source: "IsaiahAI 5.3/6.0 fallback", key: process.env.GEMINI_API_KEY_53_60 },
       { source: "Shared Gemini fallback", key: process.env.GEMINI_API_KEY }
