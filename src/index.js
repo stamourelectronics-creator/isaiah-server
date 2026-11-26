@@ -482,9 +482,13 @@ function geminiModelForWebsite(model) {
 }
 
 function websiteGeminiFallbackModels(model) {
-  // Keep several independent Flash model IDs in the retry chain for outages.
+  // Prefer the known-good Flash route for models whose latest provider routes
+  // have been timing out or returning 503, then retain the more advanced routes
+  // as fallbacks. The selected model identity and system prompt stay intact.
+  const configuredPrimary = geminiModelForWebsite(model);
+  const preferStableFlash = ["isaiahai_7_super", "isaiah_max_6_0", "open_isaiah"].includes(model);
   const candidates = [
-    geminiModelForWebsite(model),
+    ...(preferStableFlash ? [GEMINI_53_MODEL, configuredPrimary] : [configuredPrimary]),
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     GEMINI_53_MODEL,
@@ -1744,10 +1748,10 @@ async function handleAgent(req, res, body) {
   const codeProGeminiCredentials = getCodeProGeminiCredentials();
   if (codeProGeminiCredentials.length) {
     const codeProModelCandidates = [...new Set([
+      GEMINI_53_MODEL,
       GEMINI_CODEPRO_MODEL,
       "gemini-3.7-flash",
       "gemini-3.6-flash",
-      GEMINI_53_MODEL,
       GEMINI_FALLBACK_MODEL
     ].filter(Boolean))];
     const attempts = codeProGeminiCredentials.flatMap((credential) =>
