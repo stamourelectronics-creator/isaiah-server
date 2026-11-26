@@ -480,12 +480,7 @@ function geminiModelForWebsite(model) {
 }
 
 function websiteGeminiFallbackModels(model) {
-  // These models use a short primary + fast IsaiahAI 5.3 fallback chain.
-  // Avoid walking through multiple unavailable model IDs and stacking timeouts.
-  if (model === "isaiahai_7_super" || model === "open_isaiah") {
-    return [...new Set([geminiModelForWebsite(model), GEMINI_53_MODEL].filter(Boolean))];
-  }
-
+  // Keep several independent Flash model IDs in the retry chain for outages.
   const candidates = [
     geminiModelForWebsite(model),
     "gemini-3.7-flash",
@@ -494,6 +489,23 @@ function websiteGeminiFallbackModels(model) {
     String(process.env.GEMINI_FALLBACK_MODEL || GEMINI_FALLBACK_MODEL).trim()
   ];
   return [...new Set(candidates.filter(Boolean))];
+}
+
+function websiteGeminiApiKeys(model) {
+  const candidates = model === "isaiahai_7_super"
+    ? [
+        { source: "IsaiahAI 7.0", key: process.env.GEMINI_API_KEY_70 },
+        { source: "IsaiahAI 5.3/6.0 fallback", key: process.env.GEMINI_API_KEY_53_60 },
+        { source: "Shared Gemini fallback", key: process.env.GEMINI_API_KEY }
+      ]
+    : [{ source: "Selected model", key: getWebsiteGeminiKey(model) }];
+  const seen = new Set();
+  return candidates.filter((item) => {
+    const key = String(item.key || "").trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map((item) => ({ source: item.source, key: String(item.key).trim() }));
 }
 
 function normalizeImageInput(image) {
@@ -647,7 +659,8 @@ async function createIsaiahSuperThinkingSummary(body, answer, apiKey) {
 }
 
 async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
-  const apiKey = getWebsiteGeminiKey(model);
+  const apiKeys = websiteGeminiApiKeys(model);
+  const apiKey = apiKeys[0]?.key || "";
   if (!apiKey) {
     const variable = model === "isaiah_5_3" || model === "isaiah_max_6_0"
       ? "GEMINI_API_KEY_53_60"
@@ -657,14 +670,11 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
 
   const thinking = normalizeThinking(body);
   const generationConfig = {
-    maxOutputTokens: model === "isaiah_5_3" ? 4096 : model === "isaiahai_7_super" ? 4096 : 8192,
+    // Thinking tokens share the output budget; preserve room for visible text.
+    maxOutputTokens: 8192,
     temperature: model === "isaiah_5_3" ? 0.65 : 0.45
   };
-  if (model === "isaiahai_7_super") {
-    generationConfig.thinkingConfig = {
-      thinkingLevel: thinking.mode === "thinking" ? thinking.effort.toUpperCase() : "LOW"
-    };
-  } else if (thinking.mode === "thinking") {
+  if (thinking.mode === "thinking") {
     generationConfig.thinkingConfig = { thinkingLevel: thinking.effort.toUpperCase() };
   }
 
@@ -673,9 +683,11 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
   const modelNames = websiteGeminiFallbackModels(model);
 
   const attempts = [];
-  for (const modelName of modelNames) {
-    if (groundingAllowed) attempts.push({ modelName, useGrounding: true });
-    attempts.push({ modelName, useGrounding: false });
+  for (const credential of apiKeys) {
+    for (const modelName of modelNames) {
+      if (groundingAllowed) attempts.push({ modelName, apiKey: credential.key, keySource: credential.source, useGrounding: true });
+      attempts.push({ modelName, apiKey: credential.key, keySource: credential.source, useGrounding: false });
+    }
   }
 
   let lastError = null;
@@ -691,7 +703,7 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
     try {
       const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(attempt.modelName) + ":generateContent", {
         method: "POST",
-        headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
+        headers: { "x-goog-api-key": attempt.apiKey, "Content-Type": "application/json", "Accept": "application/json" },
         body: JSON.stringify(requestBody),
         signal: AbortSignal.timeout(model === "isaiahai_7_super" ? 120000 : GEMINI_REQUEST_TIMEOUT_MS)
       });
@@ -705,6 +717,7 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
         console.warn("[WEBSITE_GEMINI]", JSON.stringify({
           selectedModel: model,
           providerModel: attempt.modelName,
+          keySource: attempt.keySource,
           grounded: attempt.useGrounding,
           status: response.status,
           fallbackAvailable: attemptIndex < attempts.length - 1
@@ -725,7 +738,7 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
         .slice(0, 12);
 
       const thinkingSummary = model === "isaiahai_7_super" && body.showThinking === true
-        ? await createIsaiahSuperThinkingSummary(body, content, apiKey)
+        ? await createIsaiahSuperThinkingSummary(body, content, attempt.apiKey)
         : "";
       return {
         brand: identity.brand || (model === "open_isaiah" ? "Open-Isaiah" : model === "isaiah_codepro" ? "IsaiahAI CodePro" : model === "isaiah_5_3" ? "IsaiahAI 5.3 Flash" : model === "isaiah_max_6_0" ? "Isaiah Max 6.0" : "IsaiahAI 7.0 SUPER"),
@@ -745,6 +758,7 @@ async function callWebsiteGemini(body, model, systemPrompt, identity = {}) {
       console.warn("[WEBSITE_GEMINI]", JSON.stringify({
         selectedModel: model,
         providerModel: attempt.modelName,
+        keySource: attempt.keySource,
         grounded: attempt.useGrounding,
         timedOut: error?.name === "TimeoutError" || error?.name === "AbortError",
         fallbackAvailable: attemptIndex < attempts.length - 1
@@ -850,24 +864,24 @@ async function handleOpenIsaiah(body, res) {
 }
 
 async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}) {
-  const apiKey = getWebsiteGeminiKey(model);
+  const apiKeys = websiteGeminiApiKeys(model);
+  const apiKey = apiKeys[0]?.key || "";
   if (!apiKey) throw Object.assign(new Error("The selected model is not configured."), { status: 503 });
 
   const isSuper = model === "isaiahai_7_super";
   const thinking = normalizeThinking(body);
   const generationConfig = {
-    maxOutputTokens: model === "isaiah_5_3" ? 4096 : isSuper ? 4096 : 8192,
+    maxOutputTokens: 8192,
     temperature: model === "isaiah_5_3" ? 0.65 : 0.45
   };
-  if (isSuper) {
-    generationConfig.thinkingConfig = {
-      thinkingLevel: thinking.mode === "thinking" ? thinking.effort.toUpperCase() : "LOW"
-    };
-  } else if (thinking.mode === "thinking") {
+  if (thinking.mode === "thinking") {
     generationConfig.thinkingConfig = { thinkingLevel: thinking.effort.toUpperCase() };
   }
 
   const modelNames = websiteGeminiFallbackModels(model);
+  const attempts = apiKeys.flatMap((credential) => modelNames.map((modelName) => ({
+    modelName, apiKey: credential.key, keySource: credential.source
+  })));
   // Desktop agent turns may need a longer planning period before the first
   // fenced command appears. Keep a generous first-token budget and tolerate
   // ordinary pauses between streamed tokens without aborting the whole turn.
@@ -903,8 +917,9 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
   }, 10000);
 
   try {
-    for (let attemptIndex = 0; attemptIndex < modelNames.length; attemptIndex += 1) {
-      const candidateModel = modelNames[attemptIndex];
+    for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
+      const attempt = attempts[attemptIndex];
+      const candidateModel = attempt.modelName;
       const attemptStartedAt = Date.now();
       const firstTokenDeadline = attemptStartedAt + firstTokenBudgetMs;
       const controller = new AbortController();
@@ -930,7 +945,7 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
             {
               method: "POST",
               headers: {
-                "x-goog-api-key": apiKey,
+                "x-goog-api-key": attempt.apiKey,
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream"
               },
@@ -951,7 +966,8 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
             selectedModel: model,
             providerModel: candidateModel,
             status: response.status,
-            fallbackAvailable: attemptIndex < modelNames.length - 1
+            keySource: attempt.keySource,
+            fallbackAvailable: attemptIndex < attempts.length - 1
           }));
           if (!retryable) break;
           continue;
@@ -1061,7 +1077,8 @@ async function streamWebsiteGemini(body, model, systemPrompt, res, identity = {}
           selectedModel: model,
           providerModel: candidateModel,
           timedOut: /timed out|time to start|stopped sending|abort/i.test(lastError.message),
-          fallbackAvailable: attemptIndex < modelNames.length - 1
+          keySource: attempt.keySource,
+            fallbackAvailable: attemptIndex < attempts.length - 1
         }));
       } finally {
         try { controller.abort(); } catch {}
@@ -1364,17 +1381,13 @@ async function searchIsaiahWeb(query, engine, offset = 0, safeSearch = "Moderate
   const selected = String(engine || "isaiah").toLowerCase();
   const allEngines = ["duckduckgo", "bing", "brave", "google"];
   const primaryEngines = selected === "isaiah" ? allEngines : [selected];
-  const primaryGroups = await Promise.all(
-    primaryEngines.map((name) => fetchSearchPage(name, query, offset, safeSearch))
-  );
-  let results = mergeUniqueSearchResults(primaryGroups, 30);
-
-  // Bing's RSS endpoint provides a second result extraction route when its
-  // HTML markup changes or crawler-facing HTML is blocked.
-  if (results.length < 20) {
-    const rssResults = await fetchBingRssSearchPage(query, offset);
-    results = mergeUniqueSearchResults([results, rssResults], 30);
-  }
+  // Fetch Bing RSS alongside HTML parsers so a markup change or crawler
+  // block on one source does not leave the first page with only a few links.
+  const [primaryGroups, rssResults] = await Promise.all([
+    Promise.all(primaryEngines.map((name) => fetchSearchPage(name, query, offset, safeSearch))),
+    fetchBingRssSearchPage(query, offset)
+  ]);
+  let results = mergeUniqueSearchResults([...primaryGroups, rssResults], 30);
 
   // Keep the chosen engine first, then supplement sparse pages with other
   // available live indexes instead of returning only a couple of links.
@@ -1397,8 +1410,8 @@ async function searchIsaiahWeb(query, engine, offset = 0, safeSearch = "Moderate
 }
 
 async function generateIsaiahSuperSummary(query, results, options = {}) {
-  const apiKey = getWebsiteGeminiKey("isaiahai_7_super");
-  if (!apiKey) throw Object.assign(new Error("IsaiahAI 7.0 SUPER is not configured for Search Assist."), { status: 503 });
+  const apiKeys = websiteGeminiApiKeys("isaiahai_7_super");
+  if (!apiKeys.length) throw Object.assign(new Error("IsaiahAI 7.0 SUPER is not configured for Search Assist."), { status: 503 });
   const detailed = options.detailed === true;
   const sources = (Array.isArray(results) ? results : []).slice(0, detailed ? 14 : 8).map((item, index) => ({
     number: index + 1,
@@ -1417,13 +1430,15 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
     "\n\nActual search results returned by IsaiahSearch:\n" + sourceText;
   const fastSummaryModel = String(process.env.ISAIAH_SEARCH_FAST_MODEL || GEMINI_53_MODEL || "gemini-3.5-flash-lite").trim();
   const modelNames = detailed
-    ? [...new Set([ISAIAH_SUPER_SUMMARY_MODEL, ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL].filter(Boolean))]
-    : [...new Set([fastSummaryModel, ISAIAH_SUPER_SUMMARY_MODEL].filter(Boolean))];
+    ? [...new Set([ISAIAH_SUPER_SUMMARY_MODEL, fastSummaryModel, ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL, "gemini-3.7-flash", "gemini-3.6-flash"].filter(Boolean))]
+    : [...new Set([fastSummaryModel, ISAIAH_SUPER_SUMMARY_MODEL, ISAIAH_SUPER_SUMMARY_FALLBACK_MODEL, "gemini-3.7-flash", "gemini-3.6-flash"].filter(Boolean))];
+  const attempts = apiKeys.flatMap((credential) => modelNames.map((modelName) => ({ ...credential, modelName })));
   let lastError = null;
-  for (let modelIndex = 0; modelIndex < modelNames.length; modelIndex += 1) {
-    const modelName = modelNames[modelIndex];
+  for (let modelIndex = 0; modelIndex < attempts.length; modelIndex += 1) {
+    const attempt = attempts[modelIndex];
+    const { modelName, key: apiKey } = attempt;
     try {
-      const timeoutMs = detailed ? 30000 : (modelIndex === 0 ? 6500 : 4500);
+      const timeoutMs = detailed ? 90000 : 45000;
       const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent", {
         method: "POST",
         headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json", "Accept": "application/json" },
@@ -1437,7 +1452,8 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         lastError = Object.assign(new Error(payload?.error?.message || "IsaiahAI 7.0 SUPER could not generate the search summary."), { status: response.status >= 500 ? 502 : response.status });
-        console.warn("[ISAIAH_SEARCH_SUMMARY_ATTEMPT]", JSON.stringify({ model: modelName, status: response.status, fallbackAvailable: modelName !== modelNames[modelNames.length - 1] }));
+        console.warn("[ISAIAH_SEARCH_SUMMARY_ATTEMPT]", JSON.stringify({ model: modelName, status: response.status, keySource: attempt.source,
+          fallbackAvailable: modelIndex < attempts.length - 1 }));
         continue;
       }
       const summary = extractGeminiContent(payload).trim();
@@ -1445,7 +1461,8 @@ async function generateIsaiahSuperSummary(query, results, options = {}) {
       lastError = Object.assign(new Error("IsaiahAI 7.0 SUPER returned an empty Search Assist summary."), { status: 502 });
     } catch (error) {
       lastError = Object.assign(new Error(String(error?.message || error).slice(0, 240)), { status: 502 });
-      console.warn("[ISAIAH_SEARCH_SUMMARY_ATTEMPT]", JSON.stringify({ model: modelName, timedOut: error?.name === "TimeoutError" || error?.name === "AbortError", fallbackAvailable: modelName !== modelNames[modelNames.length - 1] }));
+      console.warn("[ISAIAH_SEARCH_SUMMARY_ATTEMPT]", JSON.stringify({ model: modelName, timedOut: error?.name === "TimeoutError" || error?.name === "AbortError", keySource: attempt.source,
+          fallbackAvailable: modelIndex < attempts.length - 1 }));
     }
   }
   throw lastError || Object.assign(new Error("IsaiahAI 7.0 SUPER could not complete Search Assist."), { status: 502 });
