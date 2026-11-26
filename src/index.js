@@ -492,13 +492,34 @@ function websiteGeminiFallbackModels(model) {
 }
 
 function websiteGeminiApiKeys(model) {
-  const candidates = model === "isaiahai_7_super"
-    ? [
-        { source: "IsaiahAI 7.0", key: process.env.GEMINI_API_KEY_70 },
-        { source: "IsaiahAI 5.3/6.0 fallback", key: process.env.GEMINI_API_KEY_53_60 },
-        { source: "Shared Gemini fallback", key: process.env.GEMINI_API_KEY }
-      ]
-    : [{ source: "Selected model", key: getWebsiteGeminiKey(model) }];
+  let candidates;
+  if (model === "isaiahai_7_super") {
+    candidates = [
+      { source: "IsaiahAI 7.0", key: process.env.GEMINI_API_KEY_70 },
+      { source: "IsaiahAI 5.3/6.0 fallback", key: process.env.GEMINI_API_KEY_53_60 },
+      { source: "Shared Gemini fallback", key: process.env.GEMINI_API_KEY }
+    ];
+  } else if (model === "isaiah_codepro") {
+    candidates = [
+      { source: "CodePro", key: process.env.GEMINI_API_KEY_CODEPRO },
+      { source: "IsaiahAI 7.0 fallback", key: process.env.GEMINI_API_KEY_70 },
+      { source: "IsaiahAI 5.3/6.0 fallback", key: process.env.GEMINI_API_KEY_53_60 },
+      { source: "Shared Gemini fallback", key: process.env.GEMINI_API_KEY }
+    ];
+  } else if (model === "isaiah_5_3" || model === "isaiah_max_6_0") {
+    candidates = [
+      { source: "IsaiahAI 5.3/6.0", key: process.env.GEMINI_API_KEY_53_60 },
+      { source: "Shared Gemini fallback", key: process.env.GEMINI_API_KEY },
+      { source: "IsaiahAI 7.0 fallback", key: process.env.GEMINI_API_KEY_70 }
+    ];
+  } else {
+    candidates = [
+      { source: "Open-Isaiah", key: process.env.OPEN_ISAIAH_API_KEY },
+      { source: "IsaiahAI 7.0 fallback", key: process.env.GEMINI_API_KEY_70 },
+      { source: "IsaiahAI 5.3/6.0 fallback", key: process.env.GEMINI_API_KEY_53_60 },
+      { source: "Shared Gemini fallback", key: process.env.GEMINI_API_KEY }
+    ];
+  }
   const seen = new Set();
   return candidates.filter((item) => {
     const key = String(item.key || "").trim();
@@ -1720,13 +1741,15 @@ async function handleAgent(req, res, body) {
 
   const codeProGeminiCredentials = getCodeProGeminiCredentials();
   if (codeProGeminiCredentials.length) {
-    const primaryCredential = codeProGeminiCredentials[0];
-    const fallbackCredential = codeProGeminiCredentials.find((item) => item.key !== primaryCredential.key) || primaryCredential;
-    const attempts = [
-      { credential: primaryCredential, model: GEMINI_CODEPRO_MODEL },
-      { credential: fallbackCredential, model: GEMINI_53_MODEL }
-    ].filter((item, index, all) =>
-      item.model && all.findIndex((candidate) => candidate.credential.key === item.credential.key && candidate.model === item.model) === index
+    const codeProModelCandidates = [...new Set([
+      GEMINI_CODEPRO_MODEL,
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      GEMINI_53_MODEL,
+      GEMINI_FALLBACK_MODEL
+    ].filter(Boolean))];
+    const attempts = codeProGeminiCredentials.flatMap((credential) =>
+      codeProModelCandidates.map((model) => ({ credential, model }))
     );
 
     for (const attempt of attempts) {
